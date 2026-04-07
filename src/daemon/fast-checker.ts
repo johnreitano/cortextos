@@ -745,25 +745,13 @@ Reply using: cortextos bus send-telegram ${chatId} "<your reply>"
    * moment Claude finishes its turn (Stop fires). No false positives from TUI.
    */
   isAgentActive(): boolean {
-    // Primary signal: stdout log growth. If the agent's stdout log is
-    // growing between polls, Claude is actively producing output.
-    const stdoutPath = join(this.paths.logDir, 'stdout.log');
-    try {
-      if (existsSync(stdoutPath)) {
-        const { size } = require('fs').statSync(stdoutPath);
-        if (this.stdoutLogSize < 0) {
-          // First call: establish baseline, don't report active yet
-          this.stdoutLogSize = size;
-        } else if (size > this.stdoutLogSize) {
-          this.stdoutLogSize = size;
-          return true;
-        } else {
-          this.stdoutLogSize = size;
-        }
-      } else {
-        // No log file — fall through to hook-based check
-      }
-    } catch { /* non-critical */ }
+    // Hook-based approach only. Claude Code writes ANSI escape codes (spinner,
+    // cursor movement) to stdout constantly even when idle, so stdout.log always
+    // grows — using file size as an activity signal produces a permanent "typing"
+    // indicator. Instead, rely solely on:
+    //   - lastMessageInjectedAt: when fast-checker last pushed a message in
+    //   - last_idle.flag: written by the Stop hook when Claude finishes a turn
+    // This gives accurate per-turn typing with no false positives.
 
     if (this.lastMessageInjectedAt === 0) return false;
 
