@@ -13,7 +13,7 @@ npm test
 ## Before Submitting Changes
 
 1. `npm run build` — TypeScript must compile cleanly
-2. `npm test` — all tests must pass (423 tests)
+2. `npm test` — all tests must pass
 3. Match existing patterns in `src/` for new features
 4. Add unit tests in `tests/` for any new code
 
