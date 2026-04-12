@@ -66,14 +66,21 @@ export class TelegramPoller {
 
   /**
    * Perform a single poll cycle.
+   *
+   * Offset-after-handler semantics: the offset only advances after every
+   * registered handler for an update returns successfully. If any handler
+   * throws, the update is left un-acknowledged (Telegram will re-deliver it
+   * on the next `getUpdates` call) and the remainder of the batch is deferred
+   * to preserve ordering. The offset is persisted after each successful
+   * update so a crash mid-batch does not drop confirmed state.
    */
   async pollOnce(): Promise<void> {
     const result = await this.api.getUpdates(this.offset, 1);
     if (!result?.result?.length) return;
 
     for (const update of result.result as TelegramUpdate[]) {
-      // Update offset to acknowledge this update
-      this.offset = update.update_id + 1;
+      const nextOffset = update.update_id + 1;
+      let handlerFailed = false;
 
       if (update.message) {
         for (const handler of this.messageHandlers) {
@@ -81,23 +88,33 @@ export class TelegramPoller {
             handler(update.message);
           } catch (err) {
             console.error('[telegram-poller] Message handler error:', err);
+            handlerFailed = true;
+            break;
           }
         }
       }
 
-      if (update.callback_query) {
+      if (!handlerFailed && update.callback_query) {
         for (const handler of this.callbackHandlers) {
           try {
             handler(update.callback_query);
           } catch (err) {
             console.error('[telegram-poller] Callback handler error:', err);
+            handlerFailed = true;
+            break;
           }
         }
       }
-    }
 
-    // Persist offset for crash recovery
-    this.saveOffset();
+      if (handlerFailed) {
+        // Do not advance offset — the update will be redelivered.
+        // Stop processing the rest of this batch to preserve ordering.
+        return;
+      }
+
+      this.offset = nextOffset;
+      this.saveOffset();
+    }
   }
 
   /**
