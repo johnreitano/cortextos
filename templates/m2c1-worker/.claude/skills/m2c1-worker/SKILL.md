@@ -128,6 +128,29 @@ Check inbox:
 cortextos bus check-inbox
 ```
 
+
+## Stuck Detection (self-monitoring)
+
+You must self-monitor for looping behavior. After every tool call, check: is this the same tool call I just made, with the same arguments, multiple times in a row?
+
+If you detect the same tool call repeated 5 or more times consecutively (same tool name, same arguments):
+1. Stop immediately — do not make the call again
+2. Send a stuck alert to <your-agent-name>:
+   ```
+   cortextos bus send-message <your-agent-name> urgent 'STUCK ALERT: Detected repeated tool call loop. Tool: <tool-name>. Args: <args summary>. Repeated 5 times. Pausing for supervisor guidance.'
+   ```
+3. Wait for a bus message from <your-agent-name> before continuing. Check inbox:
+   ```
+   cortextos bus check-inbox
+   ```
+4. Do not resume until the supervisor responds with instructions.
+
+Common stuck patterns to watch for:
+- Repeated `Bash` calls with the same command that keeps failing
+- Repeated `Read` calls on the same file with no subsequent action
+- Repeated `Edit` calls that fail and are retried identically
+- Repeated `WebSearch` calls with the same query
+
 Set environment:
 ```
 export CTX_AGENT_NAME="<worker-name>"
@@ -265,6 +288,35 @@ If the worker appears stuck (no bus messages, no new git commits > 15 minutes):
 3. Inject directly into the PTY if still unresponsive: `cortextos inject-worker <worker-name> "Continue with the M2C1 workflow. What phase are you on?"`
 4. Check worker status: `cortextos list-workers`
 5. If halted: `cortextos terminate-worker <worker-name>` then re-spawn
+
+
+### Handling Worker Stuck Alerts (worker-initiated)
+
+The worker self-monitors for repeated tool call loops and will send you a `STUCK ALERT` message proactively when it detects one. These arrive as urgent priority bus messages.
+
+**When you receive a STUCK ALERT:**
+
+1. Read the alert carefully — it includes the tool name and arguments that are looping
+2. Diagnose the cause:
+   - Permission error? The tool may need a different approach
+   - File not found? The path may be wrong — check it
+   - Infinite retry on a transient error? Tell worker to skip and continue
+   - Wrong approach entirely? Redirect with a different strategy
+
+```bash
+# If the approach is wrong — redirect:
+cortextos bus send-message <worker-name> normal 'Understood. Stop that approach. Instead: <alternative>. Continue from there.'
+
+# If it is a transient error — tell worker to skip:
+cortextos bus send-message <worker-name> normal 'Skip that step for now and continue to the next task. We will revisit.'
+
+# If you need to inspect first:
+cd $PROJECT_DIR && git log --oneline | head -5
+# Then respond with a specific directive
+cortextos bus send-message <worker-name> normal '<directive>'
+```
+
+**Do not send a generic 'continue' message.** The worker is paused because it is genuinely stuck — it needs a specific direction change, not permission to loop again.
 
 ---
 
