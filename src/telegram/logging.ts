@@ -159,7 +159,7 @@ export function buildRecentHistory(
     } catch { /* skip unreadable */ }
   };
 
-  readLines(inboundPath, 'Greg');
+  readLines(inboundPath, process.env.ADMIN_USERNAME ?? 'user');
   readLines(outboundPath, agentName);
 
   if (entries.length === 0) return null;
