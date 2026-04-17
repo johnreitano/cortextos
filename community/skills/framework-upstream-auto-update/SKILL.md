@@ -73,10 +73,21 @@ CORTEXTOS_CONFIRM_UPSTREAM_MERGE=yes cortextos bus check-upstream --apply
 After applying:
 ```bash
 cd /path/to/cortextos
+npm install
+npm audit --audit-level=moderate
 npm run build
 npm test
 ```
-Both must succeed. If either fails, DO NOT revert silently — report the failure to [ORCHESTRATOR] with the full error output and wait for instructions. The framework remains in its applied state; [ORCHESTRATOR] will decide whether to revert or patch.
+
+**Security gate (v2):** `npm audit --audit-level=moderate` runs AFTER `npm install` and BEFORE the build/test gate. If it reports any moderate+ vulnerability:
+- **BLOCK the merge** — do NOT proceed to build/test
+- Record the audit output (advisory IDs, affected packages, severity)
+- Report to [ORCHESTRATOR]: "Upstream merge blocked by npm audit: [advisory IDs]. Packages: [list]. Severity: [level]. Manual resolution required."
+- The merge stays unapplied until the vulnerability is resolved (upstream fix, manual override, or dep pin)
+
+This gate catches security regressions where upstream merges silently downgrade a dependency that was previously patched (e.g. carrying a pinned old version that reintroduces a known CVE).
+
+Build and test must also succeed. If either fails, DO NOT revert silently — report the failure to [ORCHESTRATOR] with the full error output and wait for instructions. The framework remains in its applied state; [ORCHESTRATOR] will decide whether to revert or patch.
 
 ### Step 5 — Handle feature or mixed batches (no apply)
 If any new commit is feature or mixed but all paths are safe:
