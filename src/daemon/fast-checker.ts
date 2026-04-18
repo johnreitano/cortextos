@@ -935,18 +935,22 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       return;
     }
 
-    // Tier 1: warning (deduped, 15min cooldown)
+    // Tier 1: warning — PTY injection on 15min cooldown, Telegram once per session
     if (effectivePct >= warn && now - this.ctxWarningFiredAt > 15 * 60_000) {
+      const firstWarning = this.ctxWarningFiredAt === 0;
       this.ctxWarningFiredAt = now;
-      const msg = `[CONTEXT] Window at ${Math.round(effectivePct)}%. Handoff triggers at ${handoff}%.`;
+      const pctRound = Math.round(effectivePct);
+      const statusSuffix = effectivePct >= handoff ? 'Handoff in progress.' : `Handoff triggers at ${handoff}%.`;
+      const msg = `[CONTEXT] Window at ${pctRound}%. ${statusSuffix}`;
       this.agent.injectMessage(msg);
-      if (this.telegramApi && this.chatId) {
+      // Only ping the user once per session — repeated warnings every 15min are noisy
+      if (firstWarning && this.telegramApi && this.chatId) {
         this.telegramApi.sendMessage(
           this.chatId,
-          `Agent ${this.agent.name}: context at ${Math.round(effectivePct)}%. Handoff will trigger at ${handoff}%.`,
+          `Agent ${this.agent.name}: context at ${pctRound}%. ${statusSuffix}`,
         ).catch(() => {});
       }
-      this.log(`Context warning fired at ${Math.round(effectivePct)}%`);
+      this.log(`Context warning fired at ${pctRound}%`);
     }
 
     // Tier 2: handoff (fires once per session lifecycle)
@@ -988,6 +992,13 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
     // Write .force-fresh + .restart-planned (hardRestart from src/bus/system.ts)
     hardRestart(this.paths, this.agent.name, `CONTEXT-FORCE-RESTART: ${reason}`);
+
+    // Reset context_status.json so the new session's FastChecker doesn't re-trigger
+    // Tier 2 immediately by reading the stale high-% value from the previous session.
+    const statusPath = join(this.paths.stateDir, 'context_status.json');
+    try {
+      writeFileSync(statusPath, JSON.stringify({ used_percentage: 0, exceeds_200k_tokens: false, written_at: new Date().toISOString() }));
+    } catch { /* non-fatal */ }
 
     // sessionRefresh() does stop() + start(); shouldContinue() will return false
     // because .force-fresh was just written, giving us a clean fresh session.
