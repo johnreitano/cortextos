@@ -935,21 +935,12 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       return;
     }
 
-    // Tier 1: warning — PTY injection on 15min cooldown, Telegram once per session
+    // Tier 1: warning — PTY injection only, no Telegram ping (context management is internal)
     if (effectivePct >= warn && now - this.ctxWarningFiredAt > 15 * 60_000) {
-      const firstWarning = this.ctxWarningFiredAt === 0;
       this.ctxWarningFiredAt = now;
       const pctRound = Math.round(effectivePct);
       const statusSuffix = effectivePct >= handoff ? 'Handoff in progress.' : `Handoff triggers at ${handoff}%.`;
-      const msg = `[CONTEXT] Window at ${pctRound}%. ${statusSuffix}`;
-      this.agent.injectMessage(msg);
-      // Only ping the user once per session — repeated warnings every 15min are noisy
-      if (firstWarning && this.telegramApi && this.chatId) {
-        this.telegramApi.sendMessage(
-          this.chatId,
-          `Agent ${this.agent.name}: context at ${pctRound}%. ${statusSuffix}`,
-        ).catch(() => {});
-      }
+      this.agent.injectMessage(`[CONTEXT] Window at ${pctRound}%. ${statusSuffix}`);
       this.log(`Context warning fired at ${pctRound}%`);
     }
 
@@ -957,6 +948,11 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     if (effectivePct >= handoff && this.ctxHandoffFiredAt === 0) {
       this.ctxHandoffFiredAt = now;
       this.ctxHandoffDeadlineAt = now + 5 * 60_000; // 5min grace for agent to cooperate
+      // Reset context_status.json so the new session doesn't re-trigger immediately
+      const statusPath = join(this.paths.stateDir, 'context_status.json');
+      try {
+        writeFileSync(statusPath, JSON.stringify({ used_percentage: 0, exceeds_200k_tokens: false, written_at: new Date().toISOString() }));
+      } catch { /* non-fatal */ }
       const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + 'Z';
       const handoffPrompt = `[CONTEXT HANDOFF REQUIRED] Context is at ${Math.round(effectivePct)}%. Write a handoff document to memory/handoffs/handoff-${ts}.md with these sections: ## Current Tasks, ## Next Actions, ## Active Crons, ## Key Context, ## Files Modified This Session. Then run: cortextos bus hard-restart --reason "context handoff at ${Math.round(effectivePct)}%" --handoff-doc <absolute path to the handoff doc you just wrote>. Do this NOW before the context window is exhausted.`;
       this.agent.injectMessage(handoffPrompt);

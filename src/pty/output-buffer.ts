@@ -19,10 +19,12 @@ export class OutputBuffer {
   private chunks: string[] = [];
   private maxChunks: number;
   private logPath: string | null;
+  private bootstrapPattern: string;
 
-  constructor(maxChunks: number = 1000, logPath?: string) {
+  constructor(maxChunks: number = 1000, logPath?: string, bootstrapPattern?: string) {
     this.maxChunks = maxChunks;
     this.logPath = logPath || null;
+    this.bootstrapPattern = bootstrapPattern || 'permissions';
   }
 
   /**
@@ -82,19 +84,25 @@ export class OutputBuffer {
   }
 
   /**
-   * Check if agent has bootstrapped (permissions prompt appeared).
+   * Check if agent has bootstrapped (ready-for-input signal appeared).
+   *
+   * For Claude Code: looks for the "permissions" status-bar text.
+   * For Hermes: looks for the "❯" prompt character (configurable via constructor).
+   * The bootstrap pattern is set at construction time by the PTY class.
    */
   isBootstrapped(): boolean {
-    // Look for Claude Code's status bar which shows "permissions" as a mode indicator.
-    // Avoid false positives from the trust folder prompt which also contains permission-related text.
-    // The status bar appears after Claude has fully initialized and is ready for input.
     const recent = this.getRecent();
     const cleaned = recent.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
-    // Trust prompt contains "trust this folder" - exclude that
-    if (cleaned.includes('trust') && !cleaned.includes('> ')) {
-      return false;
+
+    if (this.bootstrapPattern === 'permissions') {
+      // Claude Code: exclude trust-folder prompt false positives.
+      // The trust prompt shows "trust this folder" before the status bar appears.
+      if (cleaned.includes('trust') && !cleaned.includes('> ')) {
+        return false;
+      }
     }
-    return cleaned.includes('permissions');
+
+    return cleaned.includes(this.bootstrapPattern);
   }
 
   /**

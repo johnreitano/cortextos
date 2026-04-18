@@ -1,0 +1,29 @@
+{
+  "agent_name": "{{agent_name}}",
+  "enabled": true,
+  "runtime": "hermes",
+  "timezone": "America/New_York",
+  "day_mode_start": "08:00",
+  "day_mode_end": "00:00",
+  "communication_style": "casual",
+  "approval_rules": {
+    "always_ask": [
+      "external-comms",
+      "financial",
+      "deployment",
+      "data-deletion"
+    ],
+    "never_ask": []
+  },
+  "crons": [
+    {
+      "name": "heartbeat",
+      "type": "recurring",
+      "interval": "4h",
+      "prompt": "Read HEARTBEAT.md and follow its instructions. Update your heartbeat, check inbox, and work on your highest priority task."
+    }
+  ],
+  "model": "{{model}}",
+  "ctx_warning_threshold": 60,
+  "ctx_handoff_threshold": 70
+}

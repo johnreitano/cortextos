@@ -37,10 +37,10 @@ export class AgentPTY {
   private onExitHandler: ((exitCode: number, signal?: number) => void) | null = null;
   private spawnFn: SpawnFn | null = null;
 
-  constructor(env: CtxEnv, config: AgentConfig, logPath?: string) {
+  constructor(env: CtxEnv, config: AgentConfig, logPath?: string, bootstrapPattern?: string) {
     this.env = env;
     this.config = config;
-    this.outputBuffer = new OutputBuffer(1000, logPath);
+    this.outputBuffer = new OutputBuffer(1000, logPath, bootstrapPattern);
   }
 
   /**
@@ -136,12 +136,12 @@ export class AgentPTY {
       } catch { /* leave unset if context.json is missing or malformed */ }
     }
 
-    // Spawn claude directly (no shell wrapper) — cross-platform, no shell escaping needed.
+    // Spawn the agent binary directly (no shell wrapper) — cross-platform, no shell escaping needed.
     // env is passed natively via node-pty options; no bash export commands required.
     // On Windows, npm global installs create .cmd wrappers, not .exe binaries.
     // node-pty's CreateProcess requires the exact wrapper name to resolve correctly.
     const claudeArgs = this.buildClaudeArgs(mode, prompt);
-    const claudeCmd = platform() === 'win32' ? 'claude.cmd' : 'claude';
+    const claudeCmd = this.getBinaryName();
 
     this.pty = this.spawnFn!(claudeCmd, claudeArgs, {
       name: 'xterm-256color',
@@ -189,10 +189,19 @@ export class AgentPTY {
   }
 
   /**
+   * Returns the binary name for the agent process.
+   * Protected so HermesPTY can override to return 'hermes'.
+   */
+  protected getBinaryName(): string {
+    return platform() === 'win32' ? 'claude.cmd' : 'claude';
+  }
+
+  /**
    * Build the claude CLI argument array.
    * Returns args suitable for passing directly to node-pty spawn (no shell escaping needed).
+   * Protected so HermesPTY can override this for its own spawn args.
    */
-  private buildClaudeArgs(mode: 'fresh' | 'continue', prompt: string): string[] {
+  protected buildClaudeArgs(mode: 'fresh' | 'continue', prompt: string): string[] {
     const args: string[] = [];
 
     if (mode === 'continue') {

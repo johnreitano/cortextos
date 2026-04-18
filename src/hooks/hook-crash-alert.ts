@@ -196,7 +196,9 @@ async function main(): Promise<void> {
   let message = '';
   switch (endType) {
     case 'planned-restart':
-      message = `🔄 ${agentName} restarted (planned): ${reason || 'no reason given'}`;
+      message = reason?.startsWith('CONTEXT-FORCE-RESTART')
+        ? `🔄 ${agentName} restarting with memory`
+        : `🔄 ${agentName} restarted (planned): ${reason || 'no reason given'}`;
       break;
     case 'session-refresh':
       message = `♻️ ${agentName} session refresh (context exhaustion). Restarting with fresh session.`;
