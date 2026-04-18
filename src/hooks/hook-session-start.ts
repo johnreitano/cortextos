@@ -17,16 +17,12 @@
  */
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
 import { execFileSync } from 'child_process';
 
 async function main(): Promise<void> {
   const agentName = process.env.CTX_AGENT_NAME;
-  const instanceId = process.env.CTX_INSTANCE_ID || 'default';
   const org = process.env.CTX_ORG || '';
   if (!agentName) return;
-
-  const ctxRoot = join(homedir(), '.cortextos', instanceId);
 
   // 1. Heartbeat update
   try {
