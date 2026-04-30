@@ -537,7 +537,10 @@ export type IPCCommandType =
   | 'spawn-worker'
   | 'terminate-worker'
   | 'list-workers'
-  | 'inject-worker';
+  | 'inject-worker'
+  | 'reload-crons'
+  | 'fire-cron'
+  | 'inject-agent';
 
 export interface IPCRequest {
   type: IPCCommandType;

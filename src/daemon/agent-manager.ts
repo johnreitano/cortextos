@@ -735,6 +735,32 @@ export class AgentManager {
   }
 
   /**
+   * Inject text directly into a running agent's PTY.
+   * Used by `cortextos bus test-cron-fire` to fire a cron immediately for testing.
+   * Returns true if the agent is running and the inject succeeded; false otherwise.
+   */
+  injectAgent(agentName: string, text: string): boolean {
+    const entry = this.agents.get(agentName);
+    if (!entry) return false;
+    return entry.process.injectMessage(text);
+  }
+
+  /**
+   * Signal the CronScheduler for an agent to re-read crons.json.
+   * Since the scheduler runs inside the daemon singleton the actual reload is
+   * handled by the AgentProcess itself whenever it next ticks — writing
+   * crons.json atomically is sufficient for the scheduler to pick up the change.
+   * This method is a no-op hook for forward-compatibility with future in-process
+   * scheduler wiring; callers should treat `true` as "acknowledged".
+   */
+  reloadCrons(agentName: string): boolean {
+    // The CronScheduler polls crons.json on each 30s tick so the write from
+    // the CLI command is the real signal. Returning true confirms the agent
+    // is known to this daemon instance (or was at last check).
+    return this.agents.has(agentName);
+  }
+
+  /**
    * Get status of all workers (running + recently completed).
    */
   listWorkers(): WorkerStatus[] {

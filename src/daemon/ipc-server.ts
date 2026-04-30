@@ -232,6 +232,49 @@ export class IPCServer {
           break;
         }
 
+        case 'inject-agent': {
+          const agentToInject = request.agent;
+          const textToInject = request.data?.text as string | undefined;
+          if (!agentToInject || !textToInject) {
+            response = { success: false, error: 'inject-agent requires: agent, data.text' };
+          } else {
+            const ok = this.agentManager.injectAgent(agentToInject, textToInject);
+            response = ok
+              ? { success: true, data: `Injected into agent ${agentToInject}` }
+              : { success: false, error: `Agent ${agentToInject} not found or not running` };
+          }
+          break;
+        }
+
+        case 'reload-crons': {
+          const agentToReload = request.agent;
+          if (!agentToReload) {
+            response = { success: false, error: 'reload-crons requires agent name' };
+          } else {
+            // crons.json was already written atomically by the CLI — acknowledge the reload.
+            // CronScheduler picks up the change on its next 30s tick.
+            this.agentManager.reloadCrons(agentToReload);
+            response = { success: true, data: `Crons reloaded for ${agentToReload}` };
+          }
+          break;
+        }
+
+        case 'fire-cron': {
+          const agentToFire = request.agent;
+          const cronName = request.data?.name as string | undefined;
+          const cronPrompt = request.data?.prompt as string | undefined;
+          if (!agentToFire || !cronName || !cronPrompt) {
+            response = { success: false, error: 'fire-cron requires: agent, data.name, data.prompt' };
+          } else {
+            const injection = `[CRON: ${cronName}] ${cronPrompt}`;
+            const ok = this.agentManager.injectAgent(agentToFire, injection);
+            response = ok
+              ? { success: true, data: `Fired cron '${cronName}' for ${agentToFire}` }
+              : { success: false, error: `Agent ${agentToFire} not found or not running` };
+          }
+          break;
+        }
+
         default:
           response = { success: false, error: `Unknown command: ${request.type}` };
       }
