@@ -110,7 +110,7 @@ Send via Telegram:
 >
 > Is 2 hours the right frequency, or do you want reminders more/less often?"
 
-**END YOUR TURN HERE.** Do not call any more tools or produce any more output. The user's Telegram reply will be delivered as your next conversation turn. When you receive it, write their answer to config.json (update the check-approvals cron interval if they want a different frequency), then continue from Step 8.
+**END YOUR TURN HERE.** Do not call any more tools or produce any more output. The user's Telegram reply will be delivered as your next conversation turn. When you receive it, update the check-approvals cron interval via `cortextos bus update-cron $CTX_AGENT_NAME check-approvals --interval <new>` if they want a different frequency, then continue from Step 8.
 
 ### Step 8: Communication style
 
@@ -336,11 +336,10 @@ If yes, collect all 8 things (just like agent onboarding):
 - (g) Loop interval - how often to run the experiment loop (often same as window)
 - (h) Approval required before running each experiment?
 
-Then set up following `.claude/skills/autoresearch/SKILL.md` setup steps exactly. The cycle must be created with `cortextos bus manage-cycle create` including `--loop-interval`. The cron must be set up immediately after:
+Then set up following `.claude/skills/autoresearch/SKILL.md` setup steps exactly. The cycle must be created with `cortextos bus manage-cycle create` including `--loop-interval`. Register the persistent cron immediately after:
+```bash
+cortextos bus add-cron $CTX_AGENT_NAME experiment-loop <loop_interval> "Read .claude/skills/autoresearch/SKILL.md and execute the experiment loop."
 ```
-/loop <loop_interval> Read .claude/skills/autoresearch/SKILL.md and execute the experiment loop.
-```
-Add to `config.json` crons array.
 
 If no:
 > "No problem. You can tell me to configure autoresearch anytime, or the analyst will set it up when they come online."
