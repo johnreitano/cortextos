@@ -197,6 +197,161 @@ export interface CronEntry {
   type?: 'recurring' | 'once' | 'disabled';
 }
 
+// ---------------------------------------------------------------------------
+// External Persistent Cron System — Subtask 1.1
+// ---------------------------------------------------------------------------
+//
+// CronDefinition is the canonical record stored in per-agent crons.json files:
+//   .cortextOS/state/agents/{agent_name}/crons.json
+//
+// The file is an array of CronDefinition objects.  The daemon reads it, schedules
+// each enabled cron, and injects the prompt into the agent's PTY on schedule.
+//
+// Operators may edit crons.json by hand (it is intentionally human-readable).
+// Keep all field names lowercase-snake-case and all times as ISO 8601 UTC.
+//
+// Example records
+// ---------------
+//
+// Heartbeat — every 6 hours (interval shorthand):
+// {
+//   "name": "heartbeat",
+//   "schedule": "6h",
+//   "prompt": "Read HEARTBEAT.md and execute the heartbeat workflow.",
+//   "enabled": true,
+//   "created_at": "2026-04-01T00:00:00.000Z",
+//   "description": "Periodic health check and status update."
+// }
+//
+// Daily morning briefing — fixed local time via cron expression:
+// {
+//   "name": "morning-briefing",
+//   "schedule": "0 13 * * *",
+//   "prompt": "Prepare and send the morning briefing to James.",
+//   "enabled": true,
+//   "created_at": "2026-04-01T00:00:00.000Z",
+//   "description": "Daily 09:00 ET briefing (UTC offset applied in schedule).",
+//   "last_fired_at": "2026-04-28T13:00:01.042Z",
+//   "fire_count": 14
+// }
+//
+// Weekly report — cron expression with day-of-week restriction:
+// {
+//   "name": "weekly-report",
+//   "schedule": "0 16 * * 1",
+//   "prompt": "Compile and send the weekly performance report.",
+//   "enabled": true,
+//   "created_at": "2026-04-01T00:00:00.000Z",
+//   "description": "Every Monday at 12:00 ET (16:00 UTC).",
+//   "fire_count": 3
+// }
+
+/**
+ * A single persistent cron definition stored in an agent's crons.json.
+ *
+ * Stored at: `.cortextOS/state/agents/{agent_name}/crons.json`
+ *
+ * The `schedule` field accepts two formats:
+ *   - Interval shorthand: `"6h"`, `"30m"`, `"1d"`, `"2w"`
+ *     Parsed by `parseDurationMs()` from `src/bus/cron-state.ts`.
+ *   - Standard 5-field cron expression: `"0 8 * * *"`, `"0 0,6,12,18 * * *"` (every 6h)
+ *     Evaluated by the daemon scheduler (Subtask 1.3).
+ *
+ * The daemon fires the cron by injecting `[CRON: {name}] {prompt}` into
+ * the agent's PTY session.
+ */
+export interface CronDefinition {
+  // ------------------------------------------------------------------
+  // Required fields — must be present for the daemon to schedule this cron.
+  // ------------------------------------------------------------------
+
+  /**
+   * Unique identifier for this cron within the agent.
+   * Used as the key for lookups, updates, and deletions.
+   * Must be unique per agent; slugs like "heartbeat" or "morning-briefing" are recommended.
+   *
+   * @example "heartbeat"
+   * @example "morning-briefing"
+   */
+  name: string;
+
+  /**
+   * The prompt text injected into the agent PTY when the cron fires.
+   * The daemon prepends `[CRON: {name}] ` automatically for traceability.
+   *
+   * @example "Read HEARTBEAT.md and execute the heartbeat workflow."
+   */
+  prompt: string;
+
+  /**
+   * When and how often this cron fires.
+   *
+   * Accepted formats:
+   *   - Interval shorthand: `"6h"`, `"30m"`, `"1d"`, `"2w"`
+   *     The cron fires every N units after its previous fire (or after daemon start
+   *     if it has never fired).
+   *   - 5-field cron expression: `"0 8 * * *"`, `"0 0,6,12,18 * * *"`, `"0 16 * * 1"`
+   *     Evaluated against the daemon's wall clock (daemon timezone = server timezone).
+   *
+   * @example "6h"         — every six hours
+   * @example "0 13 * * *" — daily at 13:00 UTC
+   * @example "0 16 * * 1" — every Monday at 16:00 UTC
+   */
+  schedule: string;
+
+  /**
+   * Whether the daemon should fire this cron.
+   * Set to `false` to pause a cron without deleting it.
+   *
+   * @default true
+   */
+  enabled: boolean;
+
+  /**
+   * ISO 8601 UTC timestamp of when this cron definition was created.
+   * Set automatically by `cortextos bus add-cron`; operators should not modify this.
+   *
+   * @example "2026-04-01T00:00:00.000Z"
+   */
+  created_at: string;
+
+  // ------------------------------------------------------------------
+  // Optional fields — populated at runtime or by operators.
+  // ------------------------------------------------------------------
+
+  /**
+   * ISO 8601 UTC timestamp of the most recent successful fire.
+   * Updated by the daemon scheduler (Subtask 1.3) after each fire.
+   * Absent when the cron has never fired.
+   *
+   * @example "2026-04-28T13:00:01.042Z"
+   */
+  last_fired_at?: string;
+
+  /**
+   * Total number of times this cron has successfully fired.
+   * Incremented by the daemon on each successful PTY injection.
+   * Absent (or 0) when the cron has never fired.
+   */
+  fire_count?: number;
+
+  /**
+   * Human-readable description of what this cron does.
+   * Optional — for operator documentation and dashboard display.
+   *
+   * @example "Periodic health check and status update."
+   */
+  description?: string;
+
+  /**
+   * Arbitrary key-value pairs for agent-specific context.
+   * Not interpreted by the daemon; surfaced in dashboard + execution logs.
+   *
+   * @example { "priority": "high", "source": "/loop" }
+   */
+  metadata?: Record<string, unknown>;
+}
+
 export interface OrgContext {
   name?: string;
   description?: string;
