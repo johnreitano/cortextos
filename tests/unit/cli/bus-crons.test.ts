@@ -484,3 +484,139 @@ describe('bus test-cron-fire', () => {
     expect(errOut).toContain('daemon');
   });
 });
+
+// ---------------------------------------------------------------------------
+// get-cron-log
+// ---------------------------------------------------------------------------
+
+import { writeFileSync } from 'fs';
+
+/** Write a JSONL cron execution log under tmpRoot for the test agent */
+function seedExecutionLog(entries: Array<Record<string, unknown>>): void {
+  const dir = join(tmpRoot, '.cortextOS', 'state', 'agents', TEST_AGENT);
+  mkdirSync(dir, { recursive: true });
+  const lines = entries.map(e => JSON.stringify(e)).join('\n') + '\n';
+  writeFileSync(join(dir, 'cron-execution.log'), lines, 'utf-8');
+}
+
+function makeLogEntry(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    ts: '2026-04-30T10:00:00.000Z',
+    cron: 'heartbeat',
+    status: 'fired',
+    attempt: 1,
+    duration_ms: 42,
+    error: null,
+    ...overrides,
+  };
+}
+
+describe('bus get-cron-log', () => {
+  it('empty state (no log file): prints "No log entries for {agent}"', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await busCommand.parseAsync(['node', 'bus', 'get-cron-log', TEST_AGENT]);
+
+    const output = logSpy.mock.calls.flat().join('\n');
+    expect(output).toContain(`No log entries for ${TEST_AGENT}`);
+  });
+
+  it('empty state with cron filter: prints "No log entries for cron {name} on {agent}"', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await busCommand.parseAsync(['node', 'bus', 'get-cron-log', TEST_AGENT, 'heartbeat']);
+
+    const output = logSpy.mock.calls.flat().join('\n');
+    expect(output).toContain(`No log entries for cron 'heartbeat' on ${TEST_AGENT}`);
+  });
+
+  it('success: shows table with cron name, status, attempt, duration', async () => {
+    seedExecutionLog([
+      makeLogEntry({ cron: 'heartbeat', status: 'fired', attempt: 1, duration_ms: 100 }),
+      makeLogEntry({ cron: 'morning-briefing', status: 'retried', attempt: 1, error: 'timeout' }),
+    ]);
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await busCommand.parseAsync(['node', 'bus', 'get-cron-log', TEST_AGENT]);
+
+    const output = logSpy.mock.calls.flat().join('\n');
+    expect(output).toContain('heartbeat');
+    expect(output).toContain('morning-briefing');
+    expect(output).toContain('fired');
+    expect(output).toContain('retried');
+  });
+
+  it('filters by cron name', async () => {
+    seedExecutionLog([
+      makeLogEntry({ cron: 'heartbeat', status: 'fired' }),
+      makeLogEntry({ cron: 'morning-briefing', status: 'fired' }),
+      makeLogEntry({ cron: 'heartbeat', status: 'fired' }),
+    ]);
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await busCommand.parseAsync(['node', 'bus', 'get-cron-log', TEST_AGENT, 'heartbeat']);
+
+    const output = logSpy.mock.calls.flat().join('\n');
+    expect(output).toContain('heartbeat');
+    // Should NOT show morning-briefing table rows (may appear in header/title only)
+    const dataLines = output.split('\n').filter(l => l.includes('morning-briefing'));
+    expect(dataLines).toHaveLength(0);
+  });
+
+  it('--json flag emits raw JSON array', async () => {
+    seedExecutionLog([
+      makeLogEntry({ cron: 'heartbeat' }),
+      makeLogEntry({ cron: 'morning-briefing' }),
+    ]);
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await busCommand.parseAsync(['node', 'bus', 'get-cron-log', TEST_AGENT, '--json']);
+
+    const rawOutput = logSpy.mock.calls.flat().join('');
+    const parsed = JSON.parse(rawOutput);
+    expect(Array.isArray(parsed)).toBe(true);
+    expect(parsed.length).toBe(2);
+    expect(parsed[0].cron).toBe('heartbeat');
+  });
+
+  it('--limit restricts number of entries shown', async () => {
+    const entries = Array.from({ length: 10 }, (_, i) =>
+      makeLogEntry({ cron: `cron-${i}` })
+    );
+    seedExecutionLog(entries);
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await busCommand.parseAsync(['node', 'bus', 'get-cron-log', TEST_AGENT, '--limit', '3']);
+
+    const output = logSpy.mock.calls.flat().join('\n');
+    // Last 3 entries: cron-7, cron-8, cron-9
+    expect(output).toContain('cron-9');
+    expect(output).toContain('cron-8');
+    expect(output).toContain('cron-7');
+    expect(output).not.toContain('cron-0');
+  });
+
+  it('invalid --limit exits 1', async () => {
+    const exitSpy = mockExit();
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    await expect(
+      busCommand.parseAsync(['node', 'bus', 'get-cron-log', TEST_AGENT, '--limit', 'abc'])
+    ).rejects.toThrow('__PROCESS_EXIT_1__');
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    const errOut = errSpy.mock.calls.flat().join(' ');
+    expect(errOut).toContain('--limit');
+  });
+});

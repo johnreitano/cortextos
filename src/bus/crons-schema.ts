@@ -40,3 +40,28 @@ export const CRONS_FILENAME = 'crons.json';
 export function cronsPathFor(agentName: string): string {
   return join(CRONS_DIRECTORY, agentName, CRONS_FILENAME);
 }
+
+/**
+ * File name for the per-agent cron execution log (JSONL format).
+ *
+ * @example "cron-execution.log"
+ */
+export const CRON_EXECUTION_LOG_FILENAME = 'cron-execution.log';
+
+/**
+ * Return the path to an agent's cron execution log relative to CTX_ROOT.
+ *
+ * The log is JSONL: one CronExecutionLogEntry JSON object per line.
+ * It is append-only; rotation prunes to the last 1 000 lines.
+ *
+ * @param agentName - The agent's directory name (e.g. "boris", "paul").
+ * @returns Relative path string:
+ *   `.cortextOS/state/agents/{agentName}/cron-execution.log`
+ *
+ * @example
+ * cronExecutionLogPathFor("boris")
+ * // => ".cortextOS/state/agents/boris/cron-execution.log"
+ */
+export function cronExecutionLogPathFor(agentName: string): string {
+  return join(CRONS_DIRECTORY, agentName, CRON_EXECUTION_LOG_FILENAME);
+}

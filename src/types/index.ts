@@ -352,6 +352,37 @@ export interface CronDefinition {
   metadata?: Record<string, unknown>;
 }
 
+// ---------------------------------------------------------------------------
+// Cron Execution Log — Subtask 1.5
+// ---------------------------------------------------------------------------
+
+/**
+ * A single entry in the per-agent cron execution log
+ * (`$CTX_ROOT/.cortextOS/state/agents/{agent}/cron-execution.log`).
+ *
+ * The file is JSONL (one JSON object per line, newline-separated).
+ * It is append-only; log rotation prunes to the last 1 000 lines.
+ *
+ * Status semantics:
+ *   "fired"   — the fire attempt succeeded on this attempt.
+ *   "retried" — this attempt failed but more retries remain (see `error`).
+ *   "failed"  — final failure after exhausting all retries (see `error`).
+ */
+export interface CronExecutionLogEntry {
+  /** ISO 8601 UTC timestamp of the fire attempt. */
+  ts: string;
+  /** Cron name (matches CronDefinition.name). */
+  cron: string;
+  /** Outcome of this attempt. */
+  status: 'fired' | 'retried' | 'failed';
+  /** Attempt index (1-based). */
+  attempt: number;
+  /** Wall-clock duration of the fire attempt in milliseconds. */
+  duration_ms: number;
+  /** Error message if status is "retried" or "failed"; null otherwise. */
+  error: string | null;
+}
+
 export interface OrgContext {
   name?: string;
   description?: string;

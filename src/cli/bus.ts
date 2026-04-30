@@ -15,7 +15,7 @@ import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collec
 import { createApproval, updateApproval } from '../bus/approval.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs } from '../bus/cron-state.js';
-import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName } from '../bus/crons.js';
+import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
 import { nextFireFromCron } from '../daemon/cron-scheduler.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
@@ -2071,6 +2071,61 @@ busCommand
     }
 
     console.log(`Fired cron '${name}' for ${agent}`);
+  });
+
+busCommand
+  .command('get-cron-log')
+  .description('Display cron execution log entries for an agent')
+  .argument('<agent>', 'Agent name')
+  .argument('[name]', 'Cron name to filter by (optional — omit to show all crons)')
+  .option('--limit <n>', 'Maximum number of entries to show (default: 50)', '50')
+  .option('--json', 'Emit raw JSON array instead of a formatted table')
+  .action((agent: string, name: string | undefined, opts: { limit?: string; json?: boolean }) => {
+    try { validateAgentName(agent); } catch (err) { console.error(String(err)); process.exit(1); }
+
+    const limit = parseInt(opts.limit ?? '50', 10);
+    if (isNaN(limit) || limit < 0) {
+      console.error(`Error: --limit must be a non-negative integer, got '${opts.limit}'.`);
+      process.exit(1);
+    }
+
+    const entries = getExecutionLog(agent, name, limit);
+
+    if (opts.json) {
+      console.log(JSON.stringify(entries, null, 2));
+      return;
+    }
+
+    if (entries.length === 0) {
+      if (name !== undefined) {
+        console.log(`No log entries for cron '${name}' on ${agent}`);
+      } else {
+        console.log(`No log entries for ${agent}`);
+      }
+      return;
+    }
+
+    // Human-readable table: ts | cron | status | attempt | duration | error
+    const pad = (s: string, w: number) => s.padEnd(w);
+    const header = `  ${pad('Timestamp', 20)}  ${pad('Cron', 22)}  ${pad('Status', 7)}  ${pad('Att', 3)}  ${pad('ms', 7)}  Error`;
+    const sep = '-'.repeat(header.length);
+
+    console.log(`\nExecution log for ${agent}${name ? ` / ${name}` : ''} (${entries.length} entries)\n`);
+    console.log(header);
+    console.log(`  ${sep}`);
+
+    for (const e of entries) {
+      const ts = e.ts.replace('T', ' ').slice(0, 19) + 'Z';
+      const status = e.status;
+      const att = String(e.attempt);
+      const ms = String(e.duration_ms);
+      const error = e.error ?? '';
+      const cronPad = pad(e.cron.length > 22 ? e.cron.slice(0, 19) + '...' : e.cron, 22);
+      console.log(
+        `  ${pad(ts, 20)}  ${cronPad}  ${pad(status, 7)}  ${pad(att, 3)}  ${pad(ms, 7)}  ${error}`
+      );
+    }
+    console.log('');
   });
 
 busCommand

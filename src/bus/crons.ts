@@ -16,8 +16,8 @@
 
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
-import type { CronDefinition } from '../types/index.js';
-import { CRONS_DIRECTORY, CRONS_FILENAME } from './crons-schema.js';
+import type { CronDefinition, CronExecutionLogEntry } from '../types/index.js';
+import { CRONS_DIRECTORY, CRONS_FILENAME, cronExecutionLogPathFor } from './crons-schema.js';
 import { atomicWriteSync } from '../utils/atomic.js';
 
 // ---------------------------------------------------------------------------
@@ -163,4 +163,60 @@ export function getCronByName(
   name: string
 ): CronDefinition | undefined {
   return readCrons(agentName).find(c => c.name === name);
+}
+
+// ---------------------------------------------------------------------------
+// Execution log reader — Subtask 1.5
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the cron execution log for an agent.
+ *
+ * @param agentName - Agent whose log file to read.
+ * @param cronName  - Optional: if provided, return only entries for this cron.
+ * @param limit     - Maximum number of entries to return (most-recent last).
+ *                    Defaults to 50.  Pass 0 for all entries.
+ * @returns Array of log entries.  Returns [] if the log file doesn't exist.
+ *          Malformed JSONL lines are silently skipped.
+ */
+export function getExecutionLog(
+  agentName: string,
+  cronName?: string,
+  limit = 50,
+): CronExecutionLogEntry[] {
+  const ctxRoot = process.env.CTX_ROOT ?? process.cwd();
+  const filePath = join(ctxRoot, cronExecutionLogPathFor(agentName));
+
+  if (!existsSync(filePath)) {
+    return [];
+  }
+
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, 'utf-8');
+  } catch {
+    return [];
+  }
+
+  const entries: CronExecutionLogEntry[] = [];
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      entries.push(JSON.parse(trimmed) as CronExecutionLogEntry);
+    } catch {
+      // Skip malformed lines
+    }
+  }
+
+  // Optional filter by cron name
+  const filtered = cronName !== undefined
+    ? entries.filter(e => e.cron === cronName)
+    : entries;
+
+  // Return last `limit` entries (most recent last), or all if limit <= 0
+  if (limit > 0 && filtered.length > limit) {
+    return filtered.slice(filtered.length - limit);
+  }
+  return filtered;
 }

@@ -28,6 +28,7 @@
 import { parseDurationMs } from '../bus/cron-state.js';
 import { readCrons, updateCron } from '../bus/crons.js';
 import type { CronDefinition } from '../types/index.js';
+import { appendExecutionLog } from './cron-execution-log.js';
 
 // ---------------------------------------------------------------------------
 // Cron expression parser — no external deps.
@@ -168,27 +169,55 @@ const RETRY_DELAYS_MS = [1_000, 4_000, 16_000];
 
 async function fireWithRetry(
   cron: CronDefinition,
+  agentName: string,
   onFire: (c: CronDefinition) => Promise<void> | void,
   logger: (msg: string) => void,
 ): Promise<boolean> {
-  for (let attempt = 0; attempt < RETRY_DELAYS_MS.length + 1; attempt++) {
+  const maxAttempts = RETRY_DELAYS_MS.length + 1; // 4 attempts total
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const start = Date.now();
     try {
       await Promise.resolve(onFire(cron));
+      appendExecutionLog(agentName, {
+        ts: new Date().toISOString(),
+        cron: cron.name,
+        status: 'fired',
+        attempt: attempt + 1,
+        duration_ms: Date.now() - start,
+        error: null,
+      });
       return true;
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
+      const duration_ms = Date.now() - start;
       if (attempt < RETRY_DELAYS_MS.length) {
         const delay = RETRY_DELAYS_MS[attempt];
         logger(
           `[cron-scheduler] onFire failed for "${cron.name}" ` +
           `(attempt ${attempt + 1}/4, retrying in ${delay}ms): ${errMsg}`
         );
+        appendExecutionLog(agentName, {
+          ts: new Date().toISOString(),
+          cron: cron.name,
+          status: 'retried',
+          attempt: attempt + 1,
+          duration_ms,
+          error: errMsg,
+        });
         await sleep(delay);
       } else {
         logger(
           `[cron-scheduler] onFire failed for "${cron.name}" ` +
           `after all 4 attempts — giving up. Last error: ${errMsg}`
         );
+        appendExecutionLog(agentName, {
+          ts: new Date().toISOString(),
+          cron: cron.name,
+          status: 'failed',
+          attempt: attempt + 1,
+          duration_ms,
+          error: errMsg,
+        });
       }
     }
   }
@@ -355,7 +384,7 @@ export class CronScheduler {
       const cron = sc.definition;
       this.logger(`[cron-scheduler] firing cron "${name}" (was due ${new Date(sc.nextFireAt).toISOString()})`);
 
-      const success = await fireWithRetry(cron, this.onFire, this.logger);
+      const success = await fireWithRetry(cron, this.agentName, this.onFire, this.logger);
 
       if (success) {
         // Persist last_fired_at + fire_count to disk
