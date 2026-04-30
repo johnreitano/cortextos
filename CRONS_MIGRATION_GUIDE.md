@@ -70,6 +70,11 @@ cortextos bus migrate-crons <agent> --force
 - Check daemon log; PTY injection may have failed (three attempts: 1s, 4s, 16s backoff).
 - `get-cron-log` will show `status: retried` entries.
 
+**Malformed or empty crons.json:**
+- If `crons.json` is corrupt (parse error) or was accidentally emptied, the daemon silently treats it as empty and logs a warning to stderr.
+- Fix: delete the malformed file and re-run `cortextos bus migrate-crons <agent> --force` to regenerate from `config.json`, or write a new `crons.json` using `cortextos bus add-cron`.
+- You can verify the file is valid JSON: `cat "${CTX_ROOT}/state/{agent}/crons.json" | python3 -m json.tool`
+
 **Need to revert:**
 - Delete `${CTX_ROOT}/state/{agent}/crons.json` and `${CTX_ROOT}/state/{agent}/.crons-migrated`.
 - The daemon will re-migrate from `config.json` on next start.

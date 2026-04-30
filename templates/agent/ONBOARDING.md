@@ -101,6 +101,11 @@ Then continue from step 8.
      ```bash
      cortextos bus add-cron $CTX_AGENT_NAME <workflow-name> <interval> <prompt>
      ```
+     For example:
+     ```bash
+     cortextos bus add-cron $CTX_AGENT_NAME heartbeat 6h Read HEARTBEAT.md and follow its instructions.
+     cortextos bus add-cron $CTX_AGENT_NAME daily-report "0 9 * * 1-5" Generate and send the daily analytics report.
+     ```
    - Do NOT use `/loop` for persistent scheduling — it is session-only and dies on restart.
    - If the workflow is complex (multi-step procedure), create a skill file at `.claude/skills/<workflow-name>/SKILL.md` with YAML frontmatter and detailed steps
 
