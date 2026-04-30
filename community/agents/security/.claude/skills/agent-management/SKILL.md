@@ -250,35 +250,27 @@ fi
 
 ## 6. Managing Crons
 
+Crons are daemon-managed and persisted to `${CTX_ROOT}/state/<agent>/crons.json`. The daemon dispatches them automatically — no agent-side restoration needed. Use the bus commands; do NOT edit `config.json` or use `/loop` / `CronCreate`.
+
 ### Adding a Cron
 ```bash
-AGENT="sentinel"
-ORG="myorg"
-
-node -e "
-const fs = require('fs');
-const path = '$CTX_FRAMEWORK_ROOT/orgs/$ORG/agents/$AGENT/config.json';
-const c = JSON.parse(fs.readFileSync(path));
-if (!c.crons) c.crons = [];
-c.crons.push({ name: 'new-cron', interval: '2h', prompt: 'Do the thing' });
-fs.writeFileSync(path, JSON.stringify(c, null, 2));
-"
-
-# Notify agent that crons have been updated
-cortextos bus send-message "$AGENT" normal \
-  'Crons updated in crons.json. The daemon scheduler will pick up the change automatically. To verify: cortextos bus list-crons '"$AGENT"
+cortextos bus add-cron <agent> <name> <interval-or-cron-expr> "<prompt>"
+# Example: cortextos bus add-cron sentinel new-cron 2h "Do the thing"
 ```
 
 ### Removing a Cron
 ```bash
-node -e "
-const fs = require('fs');
-const path = '$CTX_FRAMEWORK_ROOT/orgs/$ORG/agents/$AGENT/config.json';
-const c = JSON.parse(fs.readFileSync(path));
-c.crons = (c.crons || []).filter(cr => cr.name !== 'cron-to-remove');
-fs.writeFileSync(path, JSON.stringify(c, null, 2));
-"
-cortextos bus send-message "$AGENT" normal 'Cron removed from config.json. Recreate your crons on next restart.'
+cortextos bus remove-cron <agent> <name>
+```
+
+### Updating a Cron
+```bash
+cortextos bus update-cron <agent> <name> --interval <new>
+```
+
+### Listing Crons
+```bash
+cortextos bus list-crons <agent>
 ```
 
 ---
@@ -383,7 +375,7 @@ cortextos enable "$AGENT" --org "$ORG" --restart
 | Restart another agent | `cortextos bus send-message <agent> high "soft-restart" "<reason>"` |
 | Change model | Edit config.json model field + soft restart |
 | Update bot token | Edit .env BOT_TOKEN + soft restart |
-| Add cron | Edit config.json crons + notify agent |
+| Add cron | `cortextos bus add-cron <agent> <name> <interval> "<prompt>"` |
 | Check health | `cortextos status` or `cortextos bus read-all-heartbeats` |
 | List agents | `cortextos bus list-agents --format json` |
 | Check PM2 | `pm2 list` |

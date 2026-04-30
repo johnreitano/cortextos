@@ -148,10 +148,9 @@ My heartbeat cron runs every 4 hours and includes a system health check (Step 3 
 
 > "My heartbeat runs every 4 hours and checks all agent health on each cycle. I flag agents silent for more than 5 hours and alert the orchestrator if something is unresponsive for 8+ hours. Does that cadence work for you?"
 
-If the user wants more frequent monitoring (e.g., every 2 hours), update the heartbeat interval in `config.json`:
+If the user wants more frequent monitoring (e.g., every 2 hours), update the heartbeat cron via the bus:
 ```bash
-# Update heartbeat cron to every 2 hours if user requests it
-# Edit config.json crons[0].interval from "4h" to "2h"
+cortextos bus update-cron $CTX_AGENT_NAME heartbeat --interval 2h
 ```
 
 Otherwise, confirm defaults and move on.
@@ -528,7 +527,7 @@ if [ -n "$ORCH_NAME" ]; then
 fi
 ```
 
-### Step 26: If theta wave enabled, add cron to config.json
+### Step 26: If theta wave enabled, register the cron
 
 Compute the theta wave hour (2 hours into night mode, so it runs after auto-commit and check-upstream):
 
