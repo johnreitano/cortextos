@@ -185,6 +185,16 @@ CronCreate — name: "remind-user-3pm", prompt: "Remind the user about the 3pm c
 **Disabling without deleting**
 - Use `update-cron --enabled false` to pause a cron. It remains in `crons.json` and can be re-enabled later with `--enabled true`.
 
+**`crons.json` corrupted or emptied**
+- Every `writeCrons` call preserves the previous file as `crons.json.bak`. If the primary file is unreadable, `readCrons` automatically falls back to `.bak` — no operator intervention needed for a single corruption event.
+- If both files are bad, restore via `add-cron` or re-migrate: `cortextos bus migrate-crons $CTX_AGENT_NAME --force`.
+
+**Scheduler retained stale schedule after reload (lastGoodSchedule)**
+- If a reload produces an empty schedule (transient corruption), the daemon keeps the last-good schedule in memory and logs `WARNING: reload produced empty schedule`. Crons keep firing. Repair `crons.json` and the scheduler recovers automatically on the next reload.
+
+**Preventing dashboard test-fires**
+- Set `manualFireDisabled: true` on a cron definition to block test-fire requests from the dashboard (HTTP 403). Use for crons that must only fire on schedule.
+
 ---
 
 ## Examples
