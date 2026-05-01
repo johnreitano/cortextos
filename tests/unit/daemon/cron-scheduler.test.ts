@@ -16,9 +16,15 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const mockReadCrons  = vi.fn();
 const mockUpdateCron = vi.fn();
+// readCronsWithStatus is what cron-scheduler actually calls (post-iter-9).
+// By default it mirrors mockReadCrons with corrupt:false so existing tests
+// keep working.  Tests that need to assert the corruption path can override
+// with mockReadCronsWithStatus.mockReturnValueOnce({ crons: [...], corrupt: true }).
+const mockReadCronsWithStatus = vi.fn();
 
 vi.mock('../../../src/bus/crons.js', () => ({
   readCrons:  (...args: unknown[]) => mockReadCrons(...args),
+  readCronsWithStatus: (...args: unknown[]) => mockReadCronsWithStatus(...args),
   updateCron: (...args: unknown[]) => mockUpdateCron(...args),
 }));
 
@@ -180,6 +186,13 @@ describe('CronScheduler', () => {
     fired  = [];
     mockReadCrons.mockReset();
     mockUpdateCron.mockReset();
+    mockReadCronsWithStatus.mockReset();
+    // Default: readCronsWithStatus reflects whatever readCrons returns
+    // and reports the file as healthy (corrupt: false).
+    mockReadCronsWithStatus.mockImplementation((agent: string) => ({
+      crons: mockReadCrons(agent) ?? [],
+      corrupt: false,
+    }));
 
     scheduler = new CronScheduler({
       agentName: 'test-agent',
@@ -460,9 +473,60 @@ describe('CronScheduler', () => {
     auditScheduler.stop();
   });
 
-  it.todo(
-    'iter 9: remove-cron of LAST cron clears the schedule (currently reverts via lastGoodSchedule fallback)'
-  );
+  // -------------------------------------------------------------------------
+  // Iter 9 fix: empty-result fallback only triggers on actual corruption.
+  // The previous gate (`nextScheduled.size === 0 && lastGoodSchedule.size > 0`)
+  // could not distinguish "user removed the last cron" from "file unreadable",
+  // so it restored the just-removed cron from lastGoodSchedule and kept firing
+  // it.  Post-iter-9, readCronsWithStatus carries a `corrupt` flag and the
+  // scheduler only applies the fallback when corrupt === true.
+  // -------------------------------------------------------------------------
+
+  it('remove-cron of LAST cron clears the schedule (legitimate empty, not corruption)', async () => {
+    // Start with one cron and let it fire so lastGoodSchedule is populated.
+    mockReadCrons.mockReturnValue([
+      makeCron({ name: 'last-cron', schedule: '1m', last_fired_at: new Date(Date.now() - 30_000).toISOString() }),
+    ]);
+    scheduler.start();
+
+    // Fire once to confirm the schedule is live.
+    await vi.advanceTimersByTimeAsync(60_000 + TICK);
+    expect(fired.length).toBeGreaterThanOrEqual(1);
+    expect(scheduler.getNextFireTimes().length).toBe(1);
+
+    const firesBeforeRemove = fired.length;
+
+    // User removes the last cron — crons.json is now an empty (but valid) array.
+    // Critically: corrupt === false (the file exists and parses cleanly).
+    mockReadCronsWithStatus.mockReturnValue({ crons: [], corrupt: false });
+    scheduler.reload();
+
+    // Schedule must be EMPTY — not retained from lastGoodSchedule.
+    expect(scheduler.getNextFireTimes()).toEqual([]);
+    // No "retaining last-good schedule" warning — that path is corruption-only.
+    expect(logs.find(l => l.includes('retaining last-good schedule'))).toBeUndefined();
+
+    // Advance multiple ticks — the removed cron must NOT fire again.
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(fired.length).toBe(firesBeforeRemove);
+  });
+
+  it('reload with corrupt: true retains last-good schedule (corruption path preserved)', async () => {
+    // Build a healthy schedule first so lastGoodSchedule is populated.
+    mockReadCrons.mockReturnValue([makeCron({ name: 'health', schedule: '6h' })]);
+    scheduler.start();
+    expect(scheduler.getNextFireTimes().length).toBe(1);
+
+    // Now both primary and .bak go bad — readCronsWithStatus reports
+    // corrupt: true with crons: [].  Fallback should kick in.
+    mockReadCronsWithStatus.mockReturnValue({ crons: [], corrupt: true });
+    scheduler.reload();
+
+    // Schedule retained from lastGoodSchedule (size unchanged).
+    expect(scheduler.getNextFireTimes().length).toBe(1);
+    expect(scheduler.getNextFireTimes().map(e => e.name)).toContain('health');
+    expect(logs.find(l => l.includes('retaining last-good schedule'))).toBeDefined();
+  });
 
   it('reload() during in-flight fire with changed schedule does not cause double-fire', async () => {
     // Slow onFire we can resolve manually

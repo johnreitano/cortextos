@@ -117,6 +117,76 @@ describe('readCrons', () => {
 });
 
 // ---------------------------------------------------------------------------
+// readCronsWithStatus — corruption-vs-legitimately-empty disambiguation (iter 9)
+// ---------------------------------------------------------------------------
+
+describe('readCronsWithStatus', () => {
+  it('reports corrupt:false when the file is missing (legitimately empty)', async () => {
+    const { readCronsWithStatus } = await importCrons();
+    expect(readCronsWithStatus('boris')).toEqual({ crons: [], corrupt: false });
+  });
+
+  it('reports corrupt:false when the file parses to an empty crons array', async () => {
+    const { readCronsWithStatus } = await importCrons();
+
+    const agentDir = join(tmpRoot, '.cortextOS', 'state', 'agents', 'boris');
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(
+      join(agentDir, 'crons.json'),
+      JSON.stringify({ updated_at: '2026-05-01T00:00:00Z', crons: [] }),
+      'utf-8',
+    );
+
+    const result = readCronsWithStatus('boris');
+    expect(result).toEqual({ crons: [], corrupt: false });
+  });
+
+  it('reports corrupt:false and recovers from .bak when primary is unparseable but .bak is good', async () => {
+    const { readCronsWithStatus, writeCrons } = await importCrons();
+
+    // First write produces no .bak (no prior file). Second write copies the
+    // first file to .bak before overwriting.
+    writeCrons('boris', [makeHeartbeat()]);
+    writeCrons('boris', [makeHeartbeat({ name: 'second' })]);
+
+    const cronsPath = join(tmpRoot, '.cortextOS', 'state', 'agents', 'boris', 'crons.json');
+    // Corrupt the primary, leave .bak alone (which contains [{name:'heartbeat',...}])
+    writeFileSync(cronsPath, '{ broken json', 'utf-8');
+
+    const result = readCronsWithStatus('boris');
+    expect(result.corrupt).toBe(false);
+    expect(result.crons.map(c => c.name)).toEqual(['heartbeat']);
+  });
+
+  it('reports corrupt:true when both primary and .bak are unparseable', async () => {
+    const { readCronsWithStatus, writeCrons } = await importCrons();
+
+    writeCrons('boris', [makeHeartbeat()]);
+    writeCrons('boris', [makeHeartbeat({ name: 'second' })]); // creates .bak
+
+    const cronsPath = join(tmpRoot, '.cortextOS', 'state', 'agents', 'boris', 'crons.json');
+    const bakPath   = cronsPath + '.bak';
+    writeFileSync(cronsPath, '{ broken', 'utf-8');
+    writeFileSync(bakPath,   '<<< also broken', 'utf-8');
+
+    const result = readCronsWithStatus('boris');
+    expect(result).toEqual({ crons: [], corrupt: true });
+  });
+
+  it('reports corrupt:true when primary is unparseable and .bak does not exist', async () => {
+    const { readCronsWithStatus } = await importCrons();
+
+    const agentDir = join(tmpRoot, '.cortextOS', 'state', 'agents', 'boris');
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, 'crons.json'), '{ broken', 'utf-8');
+    // No .bak written.
+
+    const result = readCronsWithStatus('boris');
+    expect(result).toEqual({ crons: [], corrupt: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // writeCrons + readCrons roundtrip
 // ---------------------------------------------------------------------------
 
