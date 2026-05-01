@@ -25,10 +25,11 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'fs';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import type { CronDefinition, CronEntry } from '../types/index.js';
 import { readCrons, writeCrons } from '../bus/crons.js';
 import { CRONS_DIRECTORY } from '../bus/crons-schema.js';
+import { scanAgentDir } from '../utils/cron-teaching-scanner.js';
 
 // ---------------------------------------------------------------------------
 // Marker file path helpers
@@ -68,6 +69,83 @@ function deleteMarker(ctxRoot: string, agentName: string): void {
   if (existsSync(path)) {
     unlinkSync(path);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Cron-teaching upgrade advisory (Part C of upgrade-cron-teaching follow-up)
+//
+// The data migration above moves cron entries from config.json -> crons.json.
+// The *teaching* (CronCreate / /loop / config.json prose) inside each agent's
+// CLAUDE.md, AGENTS.md, ONBOARDING.md, and SKILL.md files is independent of
+// that data migration and frequently lags behind. The advisory below scans
+// the agent workspace once per agent, logs a single warning line listing the
+// stale-reference count, and drops a `.cron-teaching-checked` marker so the
+// scan does not repeat on every daemon boot. Pure advisory: never blocks
+// migration, and never modifies workspace files.
+// ---------------------------------------------------------------------------
+
+const TEACHING_MARKER_NAME = '.cron-teaching-checked';
+
+function teachingMarkerPath(ctxRoot: string, agentName: string): string {
+  return join(ctxRoot, CRONS_DIRECTORY, agentName, TEACHING_MARKER_NAME);
+}
+
+/** True when the cron-teaching scan has already run for this agent. */
+export function isTeachingChecked(ctxRoot: string, agentName: string): boolean {
+  return existsSync(teachingMarkerPath(ctxRoot, agentName));
+}
+
+function writeTeachingMarker(ctxRoot: string, agentName: string): void {
+  const path = teachingMarkerPath(ctxRoot, agentName);
+  mkdirSync(join(ctxRoot, CRONS_DIRECTORY, agentName), { recursive: true });
+  writeFileSync(path, '', { encoding: 'utf-8', mode: 0o600 });
+}
+
+function deleteTeachingMarker(ctxRoot: string, agentName: string): void {
+  const path = teachingMarkerPath(ctxRoot, agentName);
+  if (existsSync(path)) {
+    unlinkSync(path);
+  }
+}
+
+interface TeachingCheckArgs {
+  agentName: string;
+  agentDir: string;
+  ctxRoot: string;
+  force: boolean;
+  log: (msg: string) => void;
+}
+
+/**
+ * Scan one agent's workspace for stale cron-teaching patterns. Logs a single
+ * advisory line if any matches are found, then drops the
+ * `.cron-teaching-checked` marker so the scan does not repeat. Honors the
+ * `force` option for parity with `migrateCronsForAgent`.
+ */
+function runTeachingCheck(args: TeachingCheckArgs): void {
+  if (args.force) {
+    deleteTeachingMarker(args.ctxRoot, args.agentName);
+  }
+  if (isTeachingChecked(args.ctxRoot, args.agentName)) {
+    return;
+  }
+
+  // Workspace dir may not exist (e.g. migration called against a config path
+  // whose parent has been removed). Drop the marker anyway so we do not loop.
+  if (!existsSync(args.agentDir)) {
+    writeTeachingMarker(args.ctxRoot, args.agentName);
+    return;
+  }
+
+  const result = scanAgentDir(args.agentDir);
+  if (result.matches.length > 0) {
+    const fileCount = new Set(result.matches.map((m) => m.file)).size;
+    args.log(
+      `[${args.agentName}] cron-teaching upgrade recommended: ${result.matches.length} stale references in ${fileCount} files. ` +
+        `Run cortextos bus upgrade-cron-teaching ${args.agentName}`,
+    );
+  }
+  writeTeachingMarker(args.ctxRoot, args.agentName);
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +277,35 @@ export function migrateCronsForAgent(
 ): MigrationResult {
   const log = options.log ?? ((msg: string) => console.log(`[cron-migration] ${msg}`));
 
+  const result = runMigrationCore(agentName, configJsonPath, ctxRoot, options, log);
+
+  // Part C: cron-teaching upgrade advisory. Independent of cron-data migration
+  // (uses its own marker). Pure advisory — never blocks the migration result.
+  try {
+    runTeachingCheck({
+      agentName,
+      agentDir: dirname(configJsonPath),
+      ctxRoot,
+      force: !!options.force,
+      log,
+    });
+  } catch (err) {
+    log(
+      `[${agentName}] cron-teaching scan failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  return result;
+}
+
+/** Core migration logic. Public callers go through `migrateCronsForAgent`. */
+function runMigrationCore(
+  agentName: string,
+  configJsonPath: string,
+  ctxRoot: string,
+  options: MigrationOptions,
+  log: (msg: string) => void,
+): MigrationResult {
   // --force: delete marker to allow re-migration
   if (options.force) {
     deleteMarker(ctxRoot, agentName);
