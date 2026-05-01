@@ -2227,6 +2227,144 @@ busCommand
     }
   });
 
+// ---------------------------------------------------------------------------
+// upgrade-cron-teaching — Subtask 2.4: scan agent workspace for stale
+// CronCreate / /loop / config.json cron-registration teaching that predates
+// the external-persistent-crons migration.  Scan-only by default; --apply
+// performs only the safe literal substitutions known not to depend on
+// surrounding context.
+// ---------------------------------------------------------------------------
+
+busCommand
+  .command('upgrade-cron-teaching')
+  .description('Scan agent workspace files for stale CronCreate/loop/config.json cron teaching')
+  .argument('[agent]', 'Agent name to scan (omit to scan all agents under orgs/)')
+  .option('--apply', 'Perform safe literal substitutions in place (does not rewrite CronCreate references)')
+  .option('--json', 'Emit JSON instead of human-readable text')
+  .action(async (
+    agentArg: string | undefined,
+    opts: { apply?: boolean; json?: boolean },
+  ) => {
+    const { scanAgentDir, groupMatchesByFile } =
+      await import('../utils/cron-teaching-scanner.js');
+    const env = resolveEnv();
+    const frameworkRoot = env.frameworkRoot || process.cwd();
+
+    const { existsSync: fsExists, readdirSync: fsReaddir } =
+      require('fs') as typeof import('fs');
+
+    // Resolve agent name to its absolute workspace dir (orgs/*/agents/AGENT).
+    function resolveAgentDir(agent: string): string | undefined {
+      const orgsDir = join(frameworkRoot, 'orgs');
+      if (!fsExists(orgsDir)) return undefined;
+      try {
+        for (const entry of fsReaddir(orgsDir, { withFileTypes: true })) {
+          if (!entry.isDirectory()) continue;
+          const candidate = join(orgsDir, entry.name, 'agents', agent);
+          if (fsExists(candidate)) return candidate;
+        }
+      } catch {
+        // ignore scan errors
+      }
+      return undefined;
+    }
+
+    // List every agent dir under orgs/ORG/agents/.
+    function listAllAgents(): { agent: string; dir: string }[] {
+      const orgsDir = join(frameworkRoot, 'orgs');
+      const out: { agent: string; dir: string }[] = [];
+      if (!fsExists(orgsDir)) return out;
+      try {
+        for (const orgEntry of fsReaddir(orgsDir, { withFileTypes: true })) {
+          if (!orgEntry.isDirectory()) continue;
+          const agentsRoot = join(orgsDir, orgEntry.name, 'agents');
+          if (!fsExists(agentsRoot)) continue;
+          for (const a of fsReaddir(agentsRoot, { withFileTypes: true })) {
+            if (a.isDirectory() && !a.name.startsWith('.')) {
+              out.push({ agent: a.name, dir: join(agentsRoot, a.name) });
+            }
+          }
+        }
+      } catch {
+        // ignore scan errors
+      }
+      return out;
+    }
+
+    type Report = {
+      agent: string;
+      result: ReturnType<typeof scanAgentDir>;
+    };
+
+    const reports: Report[] = [];
+    if (agentArg) {
+      try { validateAgentName(agentArg); } catch (err) { console.error(String(err)); process.exit(1); }
+      const dir = resolveAgentDir(agentArg);
+      if (!dir) {
+        console.error(`Error: agent '${agentArg}' not found under ${join(frameworkRoot, 'orgs')}/*/agents/`);
+        process.exit(1);
+      }
+      reports.push({ agent: agentArg, result: scanAgentDir(dir, { apply: opts.apply }) });
+    } else {
+      for (const { agent, dir } of listAllAgents()) {
+        reports.push({ agent, result: scanAgentDir(dir, { apply: opts.apply }) });
+      }
+    }
+
+    if (opts.json) {
+      console.log(JSON.stringify(
+        reports.map((r) => ({
+          agent: r.agent,
+          agentDir: r.result.agentDir,
+          scannedFiles: r.result.scannedFiles,
+          skippedSentinelFiles: r.result.skippedSentinelFiles,
+          appliedSubstitutions: r.result.appliedSubstitutions,
+          matches: r.result.matches,
+        })),
+        null,
+        2,
+      ));
+      const totalMatches = reports.reduce((sum, r) => sum + r.result.matches.length, 0);
+      process.exit(totalMatches === 0 ? 0 : 1);
+    }
+
+    let totalMatches = 0;
+    let totalApplied = 0;
+    for (const { agent, result } of reports) {
+      totalMatches += result.matches.length;
+      totalApplied += result.appliedSubstitutions;
+
+      if (result.matches.length === 0 && result.appliedSubstitutions === 0) {
+        console.log(`✓ ${agent}: no stale cron-teaching references (${result.scannedFiles.length} files scanned)`);
+        continue;
+      }
+
+      console.log(`\n${agent}: ${result.matches.length} stale reference(s) in ${result.scannedFiles.length} files`);
+      if (result.skippedSentinelFiles.length > 0) {
+        console.log(`  (skipped ${result.skippedSentinelFiles.length} sentinel-marked file(s): ${result.skippedSentinelFiles.map((f) => f.replace(result.agentDir + '/', '')).join(', ')})`);
+      }
+      const grouped = groupMatchesByFile(result.matches);
+      for (const [file, matches] of grouped) {
+        const rel = file.replace(result.agentDir + '/', '');
+        console.log(`\n  ${rel}`);
+        for (const m of matches) {
+          console.log(`    L${m.line} [${m.pattern}]: ${m.excerpt}`);
+          console.log(`      → ${m.suggestion}`);
+        }
+      }
+      if (result.appliedSubstitutions > 0) {
+        console.log(`\n  Applied ${result.appliedSubstitutions} safe substitution(s) in place.`);
+      }
+    }
+
+    console.log(`\nSummary: ${totalMatches} stale reference(s) across ${reports.length} agent(s)` +
+      (opts.apply ? `, ${totalApplied} substitution(s) applied.` : '.'));
+    if (totalMatches > 0 && !opts.apply) {
+      console.log(`Run with --apply to substitute the safe-rewritable patterns. CronCreate / /loop references must be updated manually.`);
+    }
+    process.exit(totalMatches === 0 ? 0 : 1);
+  });
+
 busCommand
   .command('hook-context-status')
   .description('StatusLine hook: writes context window % to state/context_status.json')
