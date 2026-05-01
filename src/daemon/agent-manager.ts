@@ -775,9 +775,16 @@ export class AgentManager {
    *
    * Called by the IPC server after a `bus add-cron` / `bus remove-cron` write so
    * the daemon-level scheduler picks up the new definition without waiting for
-   * the next 30 s tick.  Returns true if the agent is known and a scheduler
-   * is running for it; false if the agent is not running (caller can retry or
-   * wait for the next daemon boot scan).
+   * the next 30 s tick.  Returns true on a successful reload (or no-op for
+   * Hermes agents, which manage their own crons natively); false if the agent
+   * is not running at all.
+   *
+   * Iter 7 fix: previously this returned `true` for any registered agent even
+   * when no scheduler existed in `cronSchedulers`, silently dropping reload
+   * requests during the start-window gap between `this.agents.set(name, ...)`
+   * and `startAgentCronScheduler(name)` (across the `await agentProcess.start()`
+   * yield in `startAgent`). Now: for non-Hermes agents that lack a scheduler we
+   * lazy-wire one so the just-written crons.json is read immediately.
    */
   reloadCrons(agentName: string): boolean {
     const scheduler = this.cronSchedulers.get(agentName);
@@ -786,8 +793,23 @@ export class AgentManager {
       console.log(`[agent-manager] Cron scheduler reloaded for ${agentName}`);
       return true;
     }
-    // Agent known but no scheduler yet (e.g. Hermes runtime or no crons.json)
-    return this.agents.has(agentName);
+
+    const entry = this.agents.get(agentName);
+    if (!entry) return false;
+
+    // Hermes manages its own crons natively — no daemon scheduler exists by
+    // design. The reload IS a no-op; report success so the caller does not
+    // retry forever.
+    if (entry.process['config']?.runtime === 'hermes') {
+      return true;
+    }
+
+    // Non-Hermes agent registered but no scheduler: this is the start-window
+    // gap. Lazy-wire the scheduler now; its start() reads crons.json which
+    // already contains the new entry the caller just wrote.
+    this.startAgentCronScheduler(agentName);
+    console.log(`[agent-manager] Cron scheduler lazy-created for ${agentName} (start-window reload)`);
+    return this.cronSchedulers.has(agentName);
   }
 
   /**
