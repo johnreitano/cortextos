@@ -28,7 +28,7 @@
 import { homedir } from 'os';
 import { join } from 'path';
 import { parseDurationMs, readCronState } from '../bus/cron-state.js';
-import { readCrons, updateCron } from '../bus/crons.js';
+import { readCronsWithStatus, updateCron } from '../bus/crons.js';
 import type { CronDefinition } from '../types/index.js';
 import { appendExecutionLog } from './cron-execution-log.js';
 
@@ -331,7 +331,7 @@ export class CronScheduler {
 
   private loadCrons(isReload: boolean): void {
     const now = Date.now();
-    const defs = readCrons(this.agentName);
+    const { crons: defs, corrupt } = readCronsWithStatus(this.agentName);
     const nextScheduled = new Map<string, ScheduledCron>();
 
     // Read cron-state.json so catch-up sees fires recorded by `bus update-cron-fire`
@@ -415,15 +415,24 @@ export class CronScheduler {
       nextScheduled.set(def.name, { definition: def, nextFireAt, changeKey: key });
     }
 
-    // LAST-GOOD-SCHEDULE FALLBACK
-    // If this is a reload and the result is empty (all-zero defs, parse failure,
-    // or external corruption), retain the previous in-memory schedule instead of
-    // silently dropping all cron definitions.  This prevents transient corruption
-    // from halting cron execution on a running scheduler.
+    // LAST-GOOD-SCHEDULE FALLBACK (corruption-only)
+    // If this is a reload AND readCronsWithStatus reported `corrupt: true`
+    // (primary file unparseable AND .bak fallback failed/missing), retain
+    // the previous in-memory schedule instead of silently dropping all cron
+    // definitions.  This prevents transient corruption from halting cron
+    // execution on a running scheduler.
     //
-    // We do NOT apply this fallback on initial start() — an empty file on startup
-    // is normal (no crons registered yet) and should produce an empty schedule.
-    if (isReload && nextScheduled.size === 0 && this.lastGoodSchedule.size > 0) {
+    // CRITICAL: we ONLY apply this fallback when `corrupt === true`.  An empty
+    // result with `corrupt === false` is a legitimate empty file — produced
+    // by `bus remove-cron` on the last cron, or a freshly initialized agent —
+    // and the schedule MUST be cleared.  Earlier versions of this method
+    // gated only on `nextScheduled.size === 0`, which restored the just-removed
+    // cron from `lastGoodSchedule` and kept firing it after removal until the
+    // daemon restarted (iter 9 regression).
+    //
+    // We do NOT apply this fallback on initial start() — an empty/missing file
+    // on startup is normal and should produce an empty schedule.
+    if (isReload && corrupt && nextScheduled.size === 0 && this.lastGoodSchedule.size > 0) {
       this.logger(
         `[cron-scheduler] WARNING: reload produced empty schedule for agent "${this.agentName}" — ` +
         `retaining last-good schedule (${this.lastGoodSchedule.size} cron(s)) until file is repaired`

@@ -74,26 +74,51 @@ function parseCronsRaw(raw: string, agentName: string, label: string): CronDefin
 }
 
 /**
- * Read all cron definitions for an agent from disk.
+ * Result of {@link readCronsWithStatus}.
+ *
+ * `corrupt` distinguishes two empty-`crons` cases that callers must treat
+ * differently:
+ *
+ *   - `corrupt: false` — the file does not exist OR it parsed cleanly to an
+ *     empty array.  This is the legitimate "no crons registered" state and
+ *     callers should honor it (e.g. clear in-memory schedule).
+ *
+ *   - `corrupt: true` — the primary file is unparseable AND the `.bak`
+ *     fallback also failed (or is missing).  The empty `crons` array here
+ *     is a degraded sentinel, not a real schedule.  Callers that maintain
+ *     a last-good in-memory snapshot (e.g. cron-scheduler) should retain
+ *     it instead of zeroing out.
+ *
+ * NEVER use `crons.length === 0` alone as a corruption signal — a freshly
+ * removed last-cron also produces `[]`.
+ */
+export interface CronsReadResult {
+  crons: CronDefinition[];
+  corrupt: boolean;
+}
+
+/**
+ * Read all cron definitions for an agent from disk, with a corruption flag.
  *
  * On parse failure the function automatically falls back to the `.bak` file
  * written by the most recent `writeCrons()` call.  This provides single-step
  * automatic recovery from transient corruption without requiring operator
  * intervention.
  *
- * @returns Array of CronDefinition objects.  Returns [] when both the primary
- *          file and the backup are absent or unparseable — never throws.
+ * Use this in preference to {@link readCrons} when the caller needs to
+ * distinguish "legitimately empty" from "catastrophic corruption" (see
+ * {@link CronsReadResult}).
  */
-export function readCrons(agentName: string): CronDefinition[] {
+export function readCronsWithStatus(agentName: string): CronsReadResult {
   const filePath = cronsFilePath(agentName);
   if (!existsSync(filePath)) {
-    return [];
+    return { crons: [], corrupt: false };
   }
   try {
     const raw = readFileSync(filePath, 'utf-8');
     const crons = parseCronsRaw(raw, agentName, 'crons.json');
     if (crons !== null) {
-      return crons;
+      return { crons, corrupt: false };
     }
   } catch (err) {
     process.stderr.write(
@@ -112,7 +137,7 @@ export function readCrons(agentName: string): CronDefinition[] {
       const bakRaw = readFileSync(bakPath, 'utf-8');
       const bakCrons = parseCronsRaw(bakRaw, agentName, 'crons.json.bak');
       if (bakCrons !== null) {
-        return bakCrons;
+        return { crons: bakCrons, corrupt: false };
       }
     } catch (err) {
       process.stderr.write(
@@ -122,7 +147,25 @@ export function readCrons(agentName: string): CronDefinition[] {
     }
   }
 
-  return [];
+  // Primary failed AND .bak failed-or-missing — catastrophic.
+  return { crons: [], corrupt: true };
+}
+
+/**
+ * Read all cron definitions for an agent from disk.
+ *
+ * On parse failure the function automatically falls back to the `.bak` file
+ * written by the most recent `writeCrons()` call.  This provides single-step
+ * automatic recovery from transient corruption without requiring operator
+ * intervention.
+ *
+ * @returns Array of CronDefinition objects.  Returns [] when both the primary
+ *          file and the backup are absent or unparseable — never throws.
+ *          NOTE: this loses the corrupt-vs-legitimately-empty distinction —
+ *          use {@link readCronsWithStatus} when that matters.
+ */
+export function readCrons(agentName: string): CronDefinition[] {
+  return readCronsWithStatus(agentName).crons;
 }
 
 /**

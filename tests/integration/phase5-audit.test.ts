@@ -418,7 +418,7 @@ describe('AD-4: Recovery audit', () => {
     expect(names).toContain('backup-audit');
   });
 
-  it('lastGoodSchedule fallback: scheduler continues firing after empty reload', async () => {
+  it('lastGoodSchedule fallback: scheduler continues firing after corrupt reload', async () => {
     addCron(AGENT, makeCron('resilient', '30m'));
 
     const fires: string[] = [];
@@ -435,9 +435,15 @@ describe('AD-4: Recovery audit', () => {
     await vi.advanceTimersByTimeAsync(TICK_MS);
     const firesBeforeCorruption = fires.length;
 
-    // Corrupt the crons.json so reload returns empty
+    // Corrupt BOTH crons.json AND crons.json.bak so readCronsWithStatus
+    // returns corrupt:true and the lastGoodSchedule fallback engages.
+    // (Iter 9 — a legitimately empty array is NOT corruption and now
+    // correctly clears the schedule, so this test must use real
+    // unparseable bytes to exercise the corruption path.)
     const cronsPath = join(tmpRoot, CRONS_DIR, 'crons.json');
-    writeFileSync(cronsPath, '{"updated_at":"2026-01-01","crons":[]}', 'utf-8');
+    const bakPath   = cronsPath + '.bak';
+    writeFileSync(cronsPath, '{ not valid json at all', 'utf-8');
+    writeFileSync(bakPath,   '<<< also corrupted >>>',     'utf-8');
     scheduler.reload();
 
     // The WARNING about retaining last-good schedule should be in logs
