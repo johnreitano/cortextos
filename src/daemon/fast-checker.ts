@@ -50,6 +50,7 @@ export class FastChecker {
 
   // Context monitor state
   private ctxConfigMtime: number = 0;
+  private ctxStartedAt: number = Date.now();        // ignores context_status.json written before this boot
   private ctxWarningFiredAt: number = 0;    // dedup: 15min cooldown between warnings
   private ctxHandoffFiredAt: number = 0;    // fires once per session (0 = not yet)
   private ctxHandoffDeadlineAt: number = 0; // timestamp after which force-restart fires
@@ -933,8 +934,11 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     try {
       const raw = readFileSync(statusPath, 'utf-8');
       const data = JSON.parse(raw);
-      const age = now - new Date(data.written_at || 0).getTime();
+      const writtenAt = new Date(data.written_at || 0).getTime();
+      const age = now - writtenAt;
       if (age > 10 * 60_000) return; // stale file — skip
+      // Skip data written before this FastChecker instance started — it's from the previous session
+      if (writtenAt < this.ctxStartedAt) return;
       pct = typeof data.used_percentage === 'number' ? data.used_percentage : null;
       exceeds200k = Boolean(data.exceeds_200k_tokens);
 
