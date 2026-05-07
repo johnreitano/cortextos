@@ -217,6 +217,51 @@ describe('CodexAppServerPTY command mapping', () => {
   });
 });
 
+describe('CodexAppServerPTY thread lifecycle', () => {
+  it('starts a new thread in fresh mode', async () => {
+    requestMock.mockResolvedValue({ result: { thread: { id: 'fresh-thread' } } });
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('fresh');
+
+    expect(requestMock).toHaveBeenCalledWith('thread/start', {
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+      config: { features: { goals: true } },
+      sessionStartSource: 'startup',
+      experimentalRawEvents: false,
+      persistExtendedHistory: true,
+    });
+    expect(fsMocks.writeFileSync).toHaveBeenCalledWith(
+      expect.stringContaining('codex-app-server-thread.json'),
+      expect.stringContaining('"threadId": "fresh-thread"'),
+      'utf-8',
+    );
+  });
+
+  it('resumes the persisted thread in continue mode', async () => {
+    fsMocks.existsSync.mockReturnValue(true);
+    fsMocks.readFileSync.mockReturnValue(JSON.stringify({
+      threadId: 'persisted-thread',
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+      updatedAt: '2026-05-07T00:00:00Z',
+    }));
+    requestMock.mockResolvedValue({ result: { thread: { id: 'persisted-thread' } } });
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('continue');
+
+    expect(requestMock).toHaveBeenCalledWith('thread/resume', {
+      threadId: 'persisted-thread',
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+      config: { features: { goals: true } },
+      excludeTurns: true,
+      persistExtendedHistory: true,
+    });
+  });
+});
+
 describe('CodexAppServerPTY event handling', () => {
   it('bootstraps on the app-server ready marker', () => {
     const pty = new CodexAppServerPTY(mockEnv, {});

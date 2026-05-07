@@ -119,3 +119,21 @@ describe('CodexPTY bootstrap pattern', () => {
     expect(pty.getOutputBuffer().isBootstrapped()).toBe(false);
   });
 });
+
+describe('CodexPTY feature flags', () => {
+  it('preserves goals flag for fresh exec-mode turns', () => {
+    const pty = new CodexPTY(mockEnv, {});
+    const args = (pty as unknown as { buildFreshArgs(prompt: string): string[] }).buildFreshArgs('hello');
+
+    expect(args).toContain('--enable');
+    expect(args).toContain('goals');
+  });
+
+  it('preserves goals flag for resume exec-mode turns', () => {
+    const pty = new CodexPTY(mockEnv, {});
+    const args = (pty as unknown as { buildResumeArgs(prompt: string): string[] }).buildResumeArgs('hello');
+
+    expect(args).toContain('--enable');
+    expect(args).toContain('goals');
+  });
+});
