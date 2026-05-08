@@ -193,7 +193,27 @@ export class AgentPTY {
    * Protected so HermesPTY can override to return 'hermes'.
    */
   protected getBinaryName(): string {
-    return platform() === 'win32' ? 'claude.cmd' : 'claude';
+    if (platform() !== 'win32') return 'claude';
+    // The Claude Code Windows installer historically shipped a `claude.cmd`
+    // shim alongside `claude.exe`. Newer installers (e.g. when claude lives
+    // under `~/.local/bin`) ship only `claude.exe` and have no `.cmd` shim.
+    // Hardcoding `claude.cmd` causes node-pty/ConPTY to fail with an empty
+    // "File not found" error before the agent ever boots.
+    //
+    // Probe PATH for whichever extension is present and prefer `.exe` —
+    // it spawns more cleanly under ConPTY than a `.cmd` wrapper, and matches
+    // what `where.exe claude` returns on current installs.
+    const pathDirs = (process.env.PATH || '').split(';').filter(Boolean);
+    for (const ext of ['.exe', '.cmd']) {
+      for (const dir of pathDirs) {
+        if (existsSync(join(dir, `claude${ext}`))) {
+          return `claude${ext}`;
+        }
+      }
+    }
+    // Neither found on PATH — fall back to the legacy default so the error
+    // message from node-pty surfaces a recognizable filename for debugging.
+    return 'claude.cmd';
   }
 
   /**
