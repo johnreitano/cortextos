@@ -1,7 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { join } from 'path';
+import { homedir } from 'os';
 
 const fsMocks = {
   existsSync: vi.fn().mockReturnValue(false),
+  mkdirSync: vi.fn(),
   writeFileSync: vi.fn(),
 };
 
@@ -10,9 +13,15 @@ vi.mock('fs', async () => {
   return {
     ...actual,
     get existsSync() { return fsMocks.existsSync; },
+    get mkdirSync() { return fsMocks.mkdirSync; },
     get writeFileSync() { return fsMocks.writeFileSync; },
   };
 });
+
+const execFileSync = vi.fn();
+vi.mock('child_process', () => ({
+  execFileSync,
+}));
 
 // Stub node-pty so CodexPTY can be imported without a native addon
 vi.mock('node-pty', () => ({
@@ -25,7 +34,7 @@ vi.mock('node-pty', () => ({
   }),
 }));
 
-const { CodexPTY } = await import('../../../src/pty/codex-pty.js');
+const { CodexPTY, codexSessionExists } = await import('../../../src/pty/codex-pty.js');
 
 const mockEnv = {
   instanceId: 'test',
@@ -39,7 +48,41 @@ const mockEnv = {
 
 beforeEach(() => {
   fsMocks.existsSync.mockReset().mockReturnValue(false);
+  fsMocks.mkdirSync.mockReset();
   fsMocks.writeFileSync.mockReset();
+  execFileSync.mockReset();
+});
+
+describe('codexSessionExists', () => {
+  it('returns false when Codex state DB is absent', () => {
+    fsMocks.existsSync.mockReturnValue(false);
+    expect(codexSessionExists('/tmp/work')).toBe(false);
+  });
+
+  it('queries state_5.sqlite for a non-archived cwd session', () => {
+    const expectedPath = join(homedir(), '.codex', 'state_5.sqlite');
+    fsMocks.existsSync.mockReturnValue(true);
+    execFileSync.mockReturnValue('thread-id\n');
+
+    expect(codexSessionExists("/tmp/paul's-work")).toBe(true);
+    expect(execFileSync).toHaveBeenCalledWith(
+      'sqlite3',
+      [
+        expectedPath,
+        "SELECT id FROM threads WHERE cwd = '/tmp/paul''s-work' AND archived = 0 ORDER BY updated_at DESC LIMIT 1;",
+      ],
+      { encoding: 'utf-8', timeout: 3000 },
+    );
+  });
+
+  it('returns false when sqlite lookup fails', () => {
+    fsMocks.existsSync.mockReturnValue(true);
+    execFileSync.mockImplementation(() => {
+      throw new Error('sqlite3 missing');
+    });
+
+    expect(codexSessionExists('/tmp/work')).toBe(false);
+  });
 });
 
 describe('CodexPTY typing-indicator wiring (issue #330)', () => {
@@ -117,5 +160,38 @@ describe('CodexPTY bootstrap pattern', () => {
     const pty = new CodexPTY(mockEnv, {});
     pty.getOutputBuffer().push('loading codex...\n');
     expect(pty.getOutputBuffer().isBootstrapped()).toBe(false);
+  });
+
+  it('builds fresh exec args with features, model, and prompt', () => {
+    const pty = new CodexPTY(mockEnv, { model: 'gpt-5-codex' });
+    const args = (pty as unknown as { buildFreshArgs(prompt: string): string[] })
+      .buildFreshArgs('hello');
+
+    expect(args).toEqual([
+      'exec',
+      '--skip-git-repo-check',
+      '--sandbox', 'workspace-write',
+      '--json',
+      '--enable', 'goals',
+      '--model', 'gpt-5-codex',
+      'hello',
+    ]);
+  });
+
+  it('builds resume exec args with --last and noninteractive bypass', () => {
+    const pty = new CodexPTY(mockEnv, {});
+    const args = (pty as unknown as { buildResumeArgs(prompt: string): string[] })
+      .buildResumeArgs('next');
+
+    expect(args).toEqual([
+      'exec',
+      'resume',
+      '--last',
+      '--skip-git-repo-check',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--json',
+      '--enable', 'goals',
+      'next',
+    ]);
   });
 });

@@ -1,6 +1,7 @@
 import { join } from 'path';
-import { existsSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
+import { execFileSync } from 'child_process';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { AgentPTY } from './agent-pty.js';
 import { OutputBuffer } from './output-buffer.js';
@@ -34,14 +35,14 @@ type SpawnFn = (file: string, args: string[], options: IPtySpawnOptions) => IPty
  * AgentPTY interface expected by agent-process.ts and fast-checker.ts.
  *
  * Key design decisions:
- * - _alive stays true until explicit kill() — daemon never sees "crashed" between turns
+ * - alive stays true until explicit kill() — daemon never sees "crashed" between turns
  * - write() accumulates bracketed-paste input until Enter, then queues an exec
  * - drainQueue() serializes: one exec process at a time, no concurrent spawns
  * - --json flag gives structured JSONL output: bootstrap on thread.started, idle on turn.completed
  * - last_idle.flag written on turn.completed (not process exit) for fast-checker typing indicator
  */
-export class CodexPTY {
-  private _alive = false;          // true after first spawn, false only after kill()
+export class CodexPTY extends AgentPTY {
+  private alive = false;           // true after first spawn, false only after kill()
   private _executing = false;      // true while a codex exec process is running
   private _writeBuffer = '';       // accumulates write() calls between Enter signals
   private _execQueue: string[] = []; // pending messages awaiting exec
@@ -62,6 +63,7 @@ export class CodexPTY {
   private _typingLastSent = 0;
 
   constructor(env: CtxEnv, config: AgentConfig, logPath?: string) {
+    super(env, config, logPath, '"type":"thread.started"');
     this._env = env;
     this._config = config;
     this._cwd = config.working_directory || env.agentDir || process.cwd();
@@ -77,7 +79,7 @@ export class CodexPTY {
    * mode='fresh': new session; mode='continue': resume prior session for this cwd.
    */
   async spawn(mode: 'fresh' | 'continue', prompt: string): Promise<void> {
-    if (this._alive) {
+    if (this.alive) {
       throw new Error('CodexPTY already spawned. Kill first.');
     }
 
@@ -86,13 +88,18 @@ export class CodexPTY {
       this._spawnFn = nodePty.spawn;
     }
 
-    this._alive = true;
+    this.alive = true;
 
     const args = mode === 'continue' && this.hasExistingSession()
       ? this.buildResumeArgs(prompt)
       : this.buildFreshArgs(prompt);
 
-    await this.runExec(args);
+    try {
+      await this.runExec(args);
+    } catch (err) {
+      this.alive = false;
+      throw err;
+    }
   }
 
   /**
@@ -101,7 +108,7 @@ export class CodexPTY {
    * Bracketed paste markers (ESC[200~ / ESC[201~) are stripped.
    */
   write(data: string): void {
-    if (!this._alive) return;
+    if (!this.alive) return;
 
     if (data === '\r') {
       // Enter received — flush accumulated buffer as a new exec turn
@@ -120,10 +127,10 @@ export class CodexPTY {
 
   /**
    * Kill the current exec process and stop the queue.
-   * Sets _alive=false so the daemon knows the session is terminated.
+   * Sets alive=false so the daemon knows the session is terminated.
    */
   kill(): void {
-    this._alive = false;
+    this.alive = false;
     this._execQueue = [];
     if (this._currentPty) {
       try {
@@ -140,7 +147,7 @@ export class CodexPTY {
    * Stays true between exec turns — the daemon uses this for crash detection.
    */
   isAlive(): boolean {
-    return this._alive;
+    return this.alive;
   }
 
   /**
@@ -193,7 +200,7 @@ export class CodexPTY {
    * Writes last_idle.flag after each turn.completed JSONL event.
    */
   private async drainQueue(): Promise<void> {
-    while (this._alive && this._execQueue.length > 0) {
+    while (this.alive && this._execQueue.length > 0) {
       const msg = this._execQueue.shift()!;
       this._executing = true;
       try {
@@ -246,6 +253,10 @@ export class CodexPTY {
         }
         // Write idle flag on process exit as fallback (catches turn.completed race)
         this.writeIdleFlag();
+        if (exitCode && exitCode !== 0 && this.alive) {
+          reject(new Error(`codex exec exited with code ${exitCode}`));
+          return;
+        }
         resolve();
       });
     });
@@ -258,6 +269,7 @@ export class CodexPTY {
    */
   private writeIdleFlag(): void {
     try {
+      mkdirSync(this._stateDir, { recursive: true });
       const flagPath = join(this._stateDir, 'last_idle.flag');
       writeFileSync(flagPath, Math.floor(Date.now() / 1000).toString(), 'utf-8');
     } catch { /* non-fatal */ }
@@ -303,14 +315,18 @@ export class CodexPTY {
    * --enable <feature>: codex feature flags defaulted on for cortextOS agents
    */
   private buildFreshArgs(prompt: string): string[] {
-    return [
+    const args = [
       'exec',
       '--skip-git-repo-check',
       '--sandbox', 'workspace-write',
       '--json',
       ...this.featureFlagArgs(),
-      prompt,
     ];
+    if (this._config.model) {
+      args.push('--model', this._config.model);
+    }
+    args.push(prompt);
+    return args;
   }
 
   /**
@@ -320,7 +336,7 @@ export class CodexPTY {
    * --enable <feature>: codex feature flags defaulted on for cortextOS agents
    */
   private buildResumeArgs(prompt: string): string[] {
-    return [
+    const args = [
       'exec',
       'resume',
       '--last',
@@ -328,8 +344,12 @@ export class CodexPTY {
       '--dangerously-bypass-approvals-and-sandbox',
       '--json',
       ...this.featureFlagArgs(),
-      prompt,
     ];
+    if (this._config.model) {
+      args.push('--model', this._config.model);
+    }
+    args.push(prompt);
+    return args;
   }
 
   /**
@@ -337,17 +357,7 @@ export class CodexPTY {
    * Queries state_5.sqlite threads table (cwd-filtered, non-archived).
    */
   private hasExistingSession(): boolean {
-    const dbPath = join(homedir(), '.codex', 'state_5.sqlite');
-    if (!existsSync(dbPath)) return false;
-    try {
-      // Use synchronous sqlite3 via child_process to avoid adding a dependency
-      const { execFileSync } = require('child_process');
-      const query = `SELECT id FROM threads WHERE cwd = '${this._cwd.replace(/'/g, "''")}' AND archived = 0 ORDER BY updated_at DESC LIMIT 1;`;
-      const result = execFileSync('sqlite3', [dbPath, query], { encoding: 'utf-8', timeout: 3000 }).trim();
-      return result.length > 0;
-    } catch {
-      return false;
-    }
+    return codexSessionExists(this._cwd);
   }
 
   /**
@@ -358,7 +368,10 @@ export class CodexPTY {
     const env: Record<string, string> = {};
 
     // Base environment
-    const keepVars = ['PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL', 'TMPDIR'];
+    const keepVars = [
+      'PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL',
+      'TMPDIR', 'TEMP', 'TMP', 'OPENAI_API_KEY', 'CODEX_HOME',
+    ];
     for (const key of keepVars) {
       if (process.env[key]) env[key] = process.env[key]!;
     }
@@ -403,5 +416,22 @@ export class CodexPTY {
         }
       }
     } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Check whether Codex has a non-archived session for this launch directory.
+ * Used by AgentProcess.shouldContinue() to select `codex exec resume --last`.
+ */
+export function codexSessionExists(cwd: string, codexHome?: string): boolean {
+  const dbPath = join(codexHome || join(homedir(), '.codex'), 'state_5.sqlite');
+  if (!existsSync(dbPath)) return false;
+  try {
+    // Use the sqlite3 CLI to avoid introducing a runtime dependency.
+    const query = `SELECT id FROM threads WHERE cwd = '${cwd.replace(/'/g, "''")}' AND archived = 0 ORDER BY updated_at DESC LIMIT 1;`;
+    const result = execFileSync('sqlite3', [dbPath, query], { encoding: 'utf-8', timeout: 3000 }).trim();
+    return result.length > 0;
+  } catch {
+    return false;
   }
 }

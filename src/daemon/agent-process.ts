@@ -3,7 +3,7 @@ import { join, sep } from 'path';
 import { homedir } from 'os';
 import type { AgentConfig, AgentStatus, CtxEnv } from '../types/index.js';
 import { AgentPTY } from '../pty/agent-pty.js';
-import { CodexPTY } from '../pty/codex-pty.js';
+import { CodexPTY, codexSessionExists } from '../pty/codex-pty.js';
 import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
 import { MessageDedup, injectMessage } from '../pty/inject.js';
 import type { TelegramAPI } from '../telegram/api.js';
@@ -472,6 +472,10 @@ export class AgentProcess {
     // Check for existing conversation
     const launchDir = this.config.working_directory || this.env.agentDir;
     if (!launchDir) return false;
+
+    if (this.config.runtime === 'codex') {
+      return codexSessionExists(launchDir);
+    }
 
     // Claude projects dir uses the absolute path with all separators replaced by dashes
     // e.g. /Users/foo/agents/boss -> -Users-foo-agents-boss (leading sep becomes -)
