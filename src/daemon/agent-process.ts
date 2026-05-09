@@ -69,6 +69,10 @@ export class AgentProcess {
   // daemon should fire the codex-app-server back-online Telegram directly
   // (skipped on handoff restart — the agent sends its own contextual reply).
   private lastSpawnWasHandoff = false;
+  // Set when a handoff doc was detected at startup so fast-checker can
+  // inject a resume nudge immediately after bootstrap instead of waiting
+  // for an external message.
+  private pendingHandoffAutoResume: boolean = false;
 
   constructor(name: string, env: CtxEnv, config: AgentConfig, log?: LogFn) {
     this.name = name;
@@ -667,6 +671,7 @@ export class AgentProcess {
       const docPath = readFileSync(markerPath, 'utf-8').trim();
       unlinkSync(markerPath);
       if (!docPath || !existsSync(docPath)) return '';
+      this.pendingHandoffAutoResume = true;
       return ` CONTEXT HANDOFF: Before restoring crons or checking inbox, read the handoff document at ${docPath} to resume your prior session state.`;
     } catch {
       return '';
@@ -694,6 +699,17 @@ export class AgentProcess {
     this.telegramApi
       .sendMessage(this.telegramChatId, `Agent ${this.name} is back online`)
       .catch(() => { /* non-fatal: notification is observability only */ });
+  }
+
+  /**
+   * Returns true (and clears the flag) if this session started from a context
+   * handoff and needs an auto-resume nudge injected after bootstrap.
+   * Called once by FastChecker immediately after bootstrap completes.
+   */
+  consumeHandoffAutoResume(): boolean {
+    if (!this.pendingHandoffAutoResume) return false;
+    this.pendingHandoffAutoResume = false;
+    return true;
   }
 
   private startSessionTimer(): void {
