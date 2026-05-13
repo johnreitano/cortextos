@@ -9,6 +9,8 @@ import { migrateCronsForAgent } from './cron-migration.js';
 import type { CronDefinition } from '../types/index.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { TelegramPoller } from '../telegram/poller.js';
+import { TelegramConnector } from '../connectors/index.js';
+import type { MessageConnector } from '../connectors/index.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
 import { recordInboundTelegram, cacheLastSent, logOutboundMessage, buildRecentHistory } from '../telegram/logging.js';
@@ -223,12 +225,13 @@ export class AgentManager {
       console.log(`[${name}] ${msg}`);
     };
 
-    // Read agent .env for Telegram credentials
+    // Read agent .env for Telegram credentials.
     const agentEnvFile = join(agentDir, '.env');
     let telegramApi: TelegramAPI | undefined;
     let chatId: string | undefined;
     let allowedUserId: string | undefined;
     let botToken: string | undefined;
+    let connector: MessageConnector | null = null;
 
     if (existsSync(agentEnvFile)) {
       const envContent = readFileSync(agentEnvFile, 'utf-8');
@@ -270,10 +273,24 @@ export class AgentManager {
 
       if (botToken && chatId) {
         telegramApi = new TelegramAPI(botToken);
+        // PR1 of pluggable connectors: build the TelegramConnector alongside
+        // the legacy telegramApi/chatId/allowedUserId fields. The connector
+        // wraps the SAME TelegramAPI for any code path that wants to dispatch
+        // through the generic interface; the legacy fields stay populated for
+        // code paths PR1 leaves Telegram-direct (FastChecker callback-edit,
+        // activity channel, approval ping, daemon crash alert). PR2 migrates
+        // those to use the connector and removes the legacy fields.
+        connector = new TelegramConnector(agentDir, {
+          BOT_TOKEN: botToken,
+          CHAT_ID: chatId,
+          ALLOWED_USER: allowedUserId ?? '',
+        });
         // Don't log sensitive user IDs — just indicate the gate is enabled
         log(`Telegram configured (chat_id: ****${String(chatId).slice(-4)}, allowed_user: enabled)`);
       }
     }
+    // (else: connector remains null — byte-identical to today's behavior of
+    // leaving telegramApi/chatId/allowedUserId undefined when the gate fails.)
 
     const agentProcess = new AgentProcess(name, env, config, log);
     // Issue #330: pass the Telegram handle into AgentProcess so CodexAppServerPTY
@@ -282,6 +299,15 @@ export class AgentManager {
     if (telegramApi && chatId) {
       agentProcess.setTelegramHandle(telegramApi, chatId);
     }
+    // PR1 of pluggable connectors: also wire the MessageConnector handle
+    // when present. AgentProcess.setConnector populates the legacy
+    // telegramApi/telegramChatId fields when the connector is a
+    // TelegramConnector (one-way mirror), so this call after
+    // setTelegramHandle is idempotent for the legacy fields and additive
+    // for the new connector field.
+    if (connector) {
+      agentProcess.setConnector(connector);
+    }
     const checker = new FastChecker(agentProcess, paths, this.frameworkRoot, {
       log,
       telegramApi,
@@ -289,6 +315,7 @@ export class AgentManager {
       // FastChecker only needs the first ID for its single-recipient typing
       // indicator / quick-checks. Multi-user is enforced by the gates above.
       allowedUserId: allowedUserId ? parseInt(allowedUserId.split(',')[0].trim(), 10) : undefined,
+      connector: connector ?? undefined,
     });
 
     // Send Telegram notification on crashes and session refreshes
