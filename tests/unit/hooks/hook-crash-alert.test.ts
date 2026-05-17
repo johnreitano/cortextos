@@ -205,6 +205,7 @@ describe('classifyFromMarkers', () => {
 
 describe('clearEndMarkers (via heartbeat)', () => {
   let tmp: string;
+  const ALL = ['.restart-planned', '.session-refresh', '.user-restart', '.user-stop', '.daemon-stop'];
 
   beforeEach(() => {
     tmp = mkdtempSync(join(tmpdir(), 'crashalert-clear-'));
@@ -214,17 +215,61 @@ describe('clearEndMarkers (via heartbeat)', () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
-  it('a heartbeat removes every pending end-type marker', () => {
-    for (const f of ['.restart-planned', '.session-refresh', '.user-restart', '.user-stop', '.daemon-stop']) {
-      writeFileSync(join(tmp, f), 'x', 'utf-8');
-    }
+  it('a post-grace heartbeat removes every pending end-type marker', () => {
+    for (const f of ALL) writeFileSync(join(tmp, f), 'x', 'utf-8');
+    // nowMs well past the grace window — the markers are no longer in-flight.
+    clearEndMarkers(tmp, Date.now() + 10 * 60 * 1000);
+    for (const f of ALL) expect(existsSync(join(tmp, f))).toBe(false);
+  });
+
+  it('leaves a fresh (within-grace) marker in place — an in-flight restart', () => {
+    for (const f of ALL) writeFileSync(join(tmp, f), 'x', 'utf-8');
+    // nowMs ≈ marker mtime → every marker is within the grace window.
     clearEndMarkers(tmp);
-    for (const f of ['.restart-planned', '.session-refresh', '.user-restart', '.user-stop', '.daemon-stop']) {
-      expect(existsSync(join(tmp, f))).toBe(false);
-    }
+    for (const f of ALL) expect(existsSync(join(tmp, f))).toBe(true);
   });
 
   it('is a no-op when no markers are present', () => {
     expect(() => clearEndMarkers(tmp)).not.toThrow();
+  });
+});
+
+describe('marker lifecycle (classify → clearEndMarkers → classify)', () => {
+  let tmp: string;
+  const MARKERS = [
+    { file: '.restart-planned', type: 'planned-restart' },
+    { file: '.session-refresh', type: 'session-refresh' },
+    { file: '.user-restart', type: 'user-restart' },
+    { file: '.user-stop', type: 'user-stop' },
+  ];
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'crashalert-lifecycle-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it('both restart firings classify, a post-grace heartbeat clears, then a real crash classifies as crash', () => {
+    writeFileSync(join(tmp, '.restart-planned'), 'planned reboot', 'utf-8');
+    // Firing #1 and #2 of the dying restart — both must see the marker.
+    expect(classifyFromMarkers(tmp, MARKERS).endType).toBe('planned-restart');
+    expect(classifyFromMarkers(tmp, MARKERS).endType).toBe('planned-restart');
+    // Post-restart session heartbeats past the grace window → marker cleared.
+    clearEndMarkers(tmp, Date.now() + 10 * 60 * 1000);
+    expect(existsSync(join(tmp, '.restart-planned'))).toBe(false);
+    // A genuine crash AFTER the clear must classify as crash — not be masked.
+    expect(classifyFromMarkers(tmp, MARKERS).endType).toBe('crash');
+  });
+
+  it('a heartbeat DURING the in-flight restart (within grace) does NOT wipe the marker — firing#2 still classifies', () => {
+    // This is the Finding-1 race: a fast-booting successor heartbeats before
+    // the dying restart's second SessionEnd firing lands.
+    writeFileSync(join(tmp, '.session-refresh'), 'rollover', 'utf-8');
+    expect(classifyFromMarkers(tmp, MARKERS).endType).toBe('session-refresh'); // firing #1
+    clearEndMarkers(tmp); // successor's first heartbeat — marker still within grace
+    expect(existsSync(join(tmp, '.session-refresh'))).toBe(true);
+    expect(classifyFromMarkers(tmp, MARKERS).endType).toBe('session-refresh'); // firing #2 — no false crash
   });
 });

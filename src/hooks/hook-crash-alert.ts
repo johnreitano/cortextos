@@ -149,19 +149,24 @@ function shouldSuppressDedup(stateDir: string, endType: string): boolean {
 }
 
 /**
- * A restart marker is valid for the hook only while younger than this. A
- * single restart fires the SessionEnd hook TWICE (~13-22s apart); the marker
- * must survive both firings. The daemon's first-post-restart heartbeat is the
- * primary clear (see updateHeartbeat in src/bus/heartbeat.ts). This TTL is
- * only the BACKSTOP for a failed start that never heartbeats: a marker older
- * than the TTL is treated as stale, ignored, and lazy-unlinked, so it cannot
- * misclassify a genuine crash arbitrarily far in the future.
+ * A restart marker is valid for the hook only while younger than this. The TTL
+ * budget runs from when the marker is WRITTEN — which is inside sessionRefresh
+ * BEFORE `await stop()` — to the LAST hook firing it must still classify, i.e.
+ * firing#2. So the budget must cover: stop()'s PTY-exit wait + the inter-firing
+ * gap. The inter-firing gap is ~13-22s typical; stop() is normally fast but is
+ * NOT bounded — BUG-011 exists precisely because PTY exit can hang. 300s is
+ * sized to absorb a slow stop() on top of the firing gap, not just the gap.
  *
- * Sized generously on a deliberate cost asymmetry: a TTL too tight re-exposes
- * the exact false-positive bug (it would ignore the marker at a slow
- * firing#2); a TTL too generous only widens the bounded failed-start
- * false-negative window — which the heartbeat-staleness monitor catches as a
- * secondary path anyway. 300s clears any plausible firing#2 delay.
+ * The daemon's post-restart heartbeat is the primary clear (see updateHeartbeat
+ * in src/bus/heartbeat.ts). This TTL is the BACKSTOP for a failed start that
+ * never heartbeats: a marker older than the TTL is treated as stale, ignored,
+ * and lazy-unlinked, so it cannot misclassify a genuine crash arbitrarily far
+ * in the future.
+ *
+ * Sized on a deliberate cost asymmetry: a TTL too tight re-exposes the exact
+ * false-positive bug (it would ignore the marker at a slow firing#2); a TTL too
+ * generous only widens the bounded failed-start false-negative window — which
+ * the heartbeat-staleness monitor catches as a secondary path anyway.
  */
 const MARKER_TTL_MS = 300_000; // 5 minutes
 
@@ -175,10 +180,15 @@ const MARKER_TTL_MS = 300_000; // 5 minutes
 async function readHookInput(): Promise<{ session_id?: string }> {
   const chunks: Buffer[] = [];
   await new Promise<void>((resolve) => {
+    // Fallback so a stdin that never ends can't hang the hook. unref()'d and
+    // cleared on a clean end/error so the timer never keeps the process alive
+    // past its work — without this the hook lingers up to 1.5s after it is done.
+    const timer = setTimeout(resolve, 1500);
+    timer.unref?.();
+    const finish = () => { clearTimeout(timer); resolve(); };
     process.stdin.on('data', (chunk: Buffer) => chunks.push(chunk));
-    process.stdin.on('end', resolve);
-    process.stdin.on('error', resolve);
-    setTimeout(resolve, 1500); // don't block forever
+    process.stdin.on('end', finish);
+    process.stdin.on('error', finish);
   });
   try {
     return JSON.parse(Buffer.concat(chunks).toString('utf-8'));
@@ -317,9 +327,10 @@ async function main(): Promise<void> {
   } catch { /* ignore */ }
 
   // Always log to crashes.log — we want visibility even when alerts are muted.
-  // session_id is recorded so the session_id dedup above is auditable after
-  // the fact: a duplicate-firing FP, if one ever slips through, is provable
-  // by two crashes.log lines sharing a session value.
+  // session_id is recorded purely for audit (there is no session_id dedup —
+  // an earlier iteration tried that and it was removed). If a duplicate-firing
+  // FP ever slips through, two crashes.log lines sharing a session value make
+  // it provable after the fact.
   const timestamp = new Date().toISOString();
   const logLine = `${timestamp} type=${endType} reason=${reason || 'none'} session=${sessionId || 'unknown'} last_task=${lastTask}\n`;
   try {
