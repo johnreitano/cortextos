@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from 'fs';
+import { appendFileSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { join, sep } from 'path';
 import { homedir } from 'os';
 import type { AgentConfig, AgentStatus, CtxEnv } from '../types/index.js';
@@ -64,6 +64,11 @@ export class AgentProcess {
   // (each start() recreates the PTY, but the Telegram handle persists).
   private telegramApi: TelegramAPI | null = null;
   private telegramChatId: string | null = null;
+  // Issue #392: tracks whether the most recently built startup prompt consumed
+  // a handoff doc marker. start() reads this after spawn to decide whether the
+  // daemon should fire the codex-app-server back-online Telegram directly
+  // (skipped on handoff restart — the agent sends its own contextual reply).
+  private lastSpawnWasHandoff = false;
 
   constructor(name: string, env: CtxEnv, config: AgentConfig, log?: LogFn) {
     this.name = name;
@@ -176,6 +181,13 @@ export class AgentProcess {
       this.status = 'running';
       this.sessionStart = new Date();
       this.log(`Running (pid: ${this.pty.getPid()})`);
+
+      // Issue #392: codex-app-server does not reliably execute the inline
+      // "Send a Telegram message saying you are back online" instruction the
+      // way claude-code does, so fire the back-online ping directly from the
+      // daemon for that runtime. Skipped on handoff restart — the agent
+      // sends its own contextual "back — ..." reply in that case.
+      this.maybeSendCodexBootNotification();
 
       // Start session timer
       this.startSessionTimer();
@@ -563,6 +575,7 @@ export class AgentProcess {
     const deliverablesBlock = this.buildDeliverablesBlock();
     const handoffBlock = this.consumeHandoffBlock();
     const isHandoffRestart = handoffBlock.length > 0;
+    this.lastSpawnWasHandoff = isHandoffRestart;
     // HANDOFF UX: the pickup message MUST be the first action after reading the handoff doc —
     // before cron restoration, before heartbeat, before anything else. Placing this instruction
     // immediately after the handoffBlock in the prompt ensures it is not buried.
@@ -579,6 +592,8 @@ export class AgentProcess {
     const nowUtc = new Date().toISOString();
     const reminderBlock = this.buildReminderBlock();
     const deliverablesBlock = this.buildDeliverablesBlock();
+    // Session refresh (--continue) is never a handoff restart.
+    this.lastSpawnWasHandoff = false;
     return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations. After checking inbox, send a Telegram message to the user saying you are back online.`;
   }
 
@@ -632,7 +647,6 @@ export class AgentProcess {
     const markerPath = join(this.env.ctxRoot, 'state', this.name, '.handoff-doc-path');
     if (!existsSync(markerPath)) return '';
     try {
-      const { unlinkSync } = require('fs');
       const docPath = readFileSync(markerPath, 'utf-8').trim();
       unlinkSync(markerPath);
       if (!docPath || !existsSync(docPath)) return '';
@@ -640,6 +654,29 @@ export class AgentProcess {
     } catch {
       return '';
     }
+  }
+
+  /**
+   * Issue #392: send the back-online Telegram notification directly from the
+   * daemon when the codex-app-server runtime spawns. The boot prompt's inline
+   * "Send a Telegram message..." instruction reaches the codex thread but is
+   * not executed reliably as a tool call, leaving James without the standard
+   * post-restart notification claude-code peers send.
+   *
+   * Skipped when:
+   *  - runtime is anything other than codex-app-server (claude-code/hermes
+   *    already emit this via the prompt),
+   *  - the most recent prompt was built for a handoff restart (the agent
+   *    sends its own contextual "back — ..." reply in that case),
+   *  - no Telegram handle has been wired (no chat_id configured).
+   */
+  private maybeSendCodexBootNotification(): void {
+    if (this.config.runtime !== 'codex-app-server') return;
+    if (this.lastSpawnWasHandoff) return;
+    if (!this.telegramApi || !this.telegramChatId) return;
+    this.telegramApi
+      .sendMessage(this.telegramChatId, `Agent ${this.name} is back online`)
+      .catch(() => { /* non-fatal: notification is observability only */ });
   }
 
   private startSessionTimer(): void {
