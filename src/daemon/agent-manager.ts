@@ -767,7 +767,7 @@ export class AgentManager {
       }, 30_000); // keep for 30s after exit
     });
 
-    await worker.spawn({ ...env, ...(model ? {} : {}) }, prompt);
+    await worker.spawn(env, prompt, config);
   }
 
   /**
