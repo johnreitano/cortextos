@@ -25,7 +25,7 @@ Ask the user each question in order. Accept their answer before moving to the ne
 
 1. **Agent name** -- What should this agent call itself? (default: Research Agent)
 2. **Timezone** -- Your local timezone (e.g. America/New_York, Europe/London, Asia/Tokyo)
-3. **Cron schedule** -- How many research runs per day? At what local times? (e.g. "twice daily at 9am and 6pm")
+3. **Daily brief time** -- What local time should the daily research brief run? (default: 9am). The template's full schedule -- daily brief, evening topic briefing, weekly trends review, and weekly quality review -- is always installed; this only sets the daily brief time.
 4. **Target audience** -- Who reads these briefs? (e.g. "technical founders building with AI", "content creators in the finance niche")
 5. **Niche / product** -- What community, product, or topic is this agent serving? (used to tune business_fit scoring)
 6. **Source categories** -- Which source types to enable? (GitHub, Reddit, YouTube, Hacker News, arXiv, RSS, custom URLs, Apify)
@@ -61,6 +61,20 @@ Write or update:
 - `research/sources.json`
 - `research/scoring-rubric.json`
 - `config.json`
+
+**Crons -- install ALL of the template's shipped crons** (do not reduce the set). The
+template ships 5 crons in `config.json`; preserve every one, each with its full
+skill-chain prompt and `update-cron-fire` call:
+
+- `heartbeat` (`4h`)
+- `daily-research-brief` (`0 9 * * *` -- adjust only the hour to the user's chosen brief time from Q3)
+- `topic-briefing` (`0 18 * * *`)
+- `weekly-trends-review` (`0 9 * * 1`)
+- `research-quality-review` (`0 12 * * 5`)
+
+Keep the shipped prompts verbatim. Only the `daily-research-brief` schedule changes to
+match the user's preference -- do NOT drop the other crons or replace them with terse
+run-only entries.
 
 Write `.env` stub reminding user to add their API keys (if .env does not already exist).
 Use `research.delivery.destination` and `research.delivery.requires_approval` for
