@@ -76,7 +76,13 @@ MEMEOF
    cortextos bus hard-restart --reason "context exhaustion"
    ```
 
-**--continue restarts** (71h auto-restart): No user notification needed. Session history is preserved.
+**--continue restarts** (71h auto-restart): No user notification needed when the reload is invisible to the user. Session history is preserved.
+
+**User-visible restarts** (coordinated fleet bounces, crash recovery the user noticed, restarts the user asked for or asked about): send ONE substantive Telegram — never a bare "back online". It must contain all four elements, written as natural prose:
+1. **Restart class** — what kind of restart this was (planned bounce / crash recovery / config reload / context handoff) and why it happened.
+2. **Carried through** — what work and state survived intact (threads, queues, watch loops).
+3. **Pending** — what still waits and on whom (decisions, results, gated items).
+4. **New since last contact** — anything that changed during or because of the restart, or say nothing changed.
 
 ---
 
