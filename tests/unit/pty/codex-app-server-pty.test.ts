@@ -495,6 +495,191 @@ Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
   });
 });
 
+describe('CodexAppServerPTY mid-turn steer', () => {
+  function makeReadyPty() {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _alive: boolean })._alive = true;
+    (pty as unknown as { _threadId: string })._threadId = 'thread-1';
+    (pty as unknown as { _rpc: { request: typeof requestMock; respondError: typeof respondErrorMock } })._rpc = {
+      request: requestMock,
+      respondError: respondErrorMock,
+    };
+    return pty;
+  }
+
+  function rpc(pty: InstanceType<typeof CodexAppServerPTY>) {
+    return pty as unknown as { handleRpcMessage(message: unknown): void };
+  }
+
+  async function startExecutingTurn(pty: InstanceType<typeof CodexAppServerPTY>, turnId = 'turn-abc') {
+    pty.write('long task');
+    pty.write('\r');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(requestMock).toHaveBeenCalledWith('turn/start', expect.objectContaining({ threadId: 'thread-1' }));
+    rpc(pty).handleRpcMessage({
+      method: 'turn/started',
+      params: { threadId: 'thread-1', turn: { id: turnId, items: [], status: 'inProgress' } },
+    });
+  }
+
+  function callsTo(method: string) {
+    return requestMock.mock.calls.filter(([m]) => m === method);
+  }
+
+  // Drain the full microtask queue (steer rejection -> catch -> enqueue -> drain
+  // chains span more ticks than a fixed number of Promise.resolve() awaits).
+  function flush() {
+    return new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  it('steers the active turn instead of queueing when executing', async () => {
+    requestMock.mockResolvedValue({ result: {} });
+    const pty = makeReadyPty();
+    await startExecutingTurn(pty);
+
+    pty.write('mid-turn message');
+    pty.write('\r');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(callsTo('turn/steer')).toHaveLength(1);
+    expect(requestMock).toHaveBeenLastCalledWith('turn/steer', {
+      threadId: 'thread-1',
+      expectedTurnId: 'turn-abc',
+      input: [{ type: 'text', text: 'mid-turn message', text_elements: [] }],
+    });
+
+    // Steered input must NOT also be queued: completing the turn fires no new turn/start.
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-abc' } } });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(callsTo('turn/start')).toHaveLength(1);
+  });
+
+  it('falls back to the queue when steer is rejected (non-steerable turn)', async () => {
+    requestMock.mockImplementation((method: string) => {
+      if (method === 'turn/steer') {
+        return Promise.reject(new Error('ActiveTurnNotSteerable'));
+      }
+      return Promise.resolve({ result: {} });
+    });
+    const pty = makeReadyPty();
+    await startExecutingTurn(pty);
+
+    pty.write('steer me');
+    pty.write('\r');
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(callsTo('turn/steer')).toHaveLength(1);
+    expect(callsTo('turn/start')).toHaveLength(1); // not submitted yet
+
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-abc' } } });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(callsTo('turn/start')).toHaveLength(2);
+    expect(callsTo('turn/start')[1][1]).toMatchObject({
+      input: [{ type: 'text', text: 'steer me', text_elements: [] }],
+    });
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: {} });
+  });
+
+  it('preserves ordering across multiple rejected steers', async () => {
+    requestMock.mockImplementation((method: string) => {
+      if (method === 'turn/steer') {
+        return Promise.reject(new Error('ExpectedTurnMismatch'));
+      }
+      return Promise.resolve({ result: {} });
+    });
+    const pty = makeReadyPty();
+    await startExecutingTurn(pty);
+
+    for (const text of ['one', 'two']) {
+      pty.write(text);
+      pty.write('\r');
+      await flush();
+    }
+    expect(callsTo('turn/steer')).toHaveLength(2);
+
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-abc' } } });
+    await flush();
+    expect(callsTo('turn/start')[1][1]).toMatchObject({
+      input: [{ type: 'text', text: 'one', text_elements: [] }],
+    });
+
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: {} });
+    await flush();
+    expect(callsTo('turn/start')[2][1]).toMatchObject({
+      input: [{ type: 'text', text: 'two', text_elements: [] }],
+    });
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: {} });
+  });
+
+  it('queues without steering while executing but before turn/started arrives', async () => {
+    requestMock.mockResolvedValue({ result: {} });
+    const pty = makeReadyPty();
+    pty.write('long task');
+    pty.write('\r');
+    await Promise.resolve();
+    await Promise.resolve();
+    // _executing is true but no turn/started notification has been seen.
+
+    pty.write('early message');
+    pty.write('\r');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(callsTo('turn/steer')).toHaveLength(0);
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: {} });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(callsTo('turn/start')).toHaveLength(2);
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: {} });
+  });
+
+  it('honors the CODEX_STEER_DISABLED kill-switch', async () => {
+    process.env.CODEX_STEER_DISABLED = '1';
+    try {
+      requestMock.mockResolvedValue({ result: {} });
+      const pty = makeReadyPty();
+      await startExecutingTurn(pty);
+
+      pty.write('mid-turn message');
+      pty.write('\r');
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(callsTo('turn/steer')).toHaveLength(0);
+      rpc(pty).handleRpcMessage({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-abc' } } });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(callsTo('turn/start')).toHaveLength(2);
+      rpc(pty).handleRpcMessage({ method: 'turn/completed', params: {} });
+    } finally {
+      delete process.env.CODEX_STEER_DISABLED;
+    }
+  });
+
+  it('clears the active turn id on turn/completed and on error notifications', async () => {
+    requestMock.mockResolvedValue({ result: {} });
+    const pty = makeReadyPty();
+    await startExecutingTurn(pty);
+    const internals = pty as unknown as { _activeTurnId: string | null };
+    expect(internals._activeTurnId).toBe('turn-abc');
+
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-abc' } } });
+    expect(internals._activeTurnId).toBeNull();
+
+    await startExecutingTurn(pty, 'turn-def');
+    expect(internals._activeTurnId).toBe('turn-def');
+    rpc(pty).handleRpcMessage({ method: 'error', params: { message: 'boom' } });
+    expect(internals._activeTurnId).toBeNull();
+  });
+});
+
 describe('CodexAppServerPTY extractTelegramPayload media types', () => {
   function extract(content: string, options?: { existsSync?: boolean; readFileSync?: string }): string | null {
     if (options?.existsSync !== undefined) fsMocks.existsSync.mockReturnValue(options.existsSync);
