@@ -236,6 +236,11 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     expect(cfg.model).toBe('openai/gpt-4.1-nano');
     expect(cfg.dangerously_skip_permissions).toBe(true);
 
+    const opencodeCfg = JSON.parse(readFileSync(join(agentDir, '.opencode', 'opencode.json'), 'utf-8'));
+    expect(opencodeCfg.permission).toEqual({ '*': 'allow' });
+    expect(opencodeCfg.agent.build.permission).toEqual({ '*': 'allow' });
+    expect(opencodeCfg.agent.plan.permission).toEqual({ '*': 'allow' });
+
     const agentsMd = readFileSync(join(agentDir, 'AGENTS.md'), 'utf-8');
     expect(agentsMd.slice(0, 1500)).toMatch(/OpenCode agent/);
     expect(agentsMd.slice(0, 1500)).toMatch(/cortextos bus send-telegram/);
