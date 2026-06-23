@@ -245,6 +245,31 @@ describe('OpencodePTY', () => {
     }
   });
 
+  it('injects inbound messages as raw control-stripped text for the OpenCode TUI', async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const pty = new OpencodePTY(mockEnv, {});
+      installSpawnMock(pty);
+      await pty.spawn('fresh', '');
+      mockPty.write.mockClear();
+
+      pty.injectMessage('hello\x1b[31m red\rthere');
+
+      expect(mockPty.write).toHaveBeenCalledTimes(1);
+      expect(mockPty.write.mock.calls[0][0]).toBe('hello red\nthere');
+      expect(mockPty.write.mock.calls[0][0]).not.toContain('\x1b[200~');
+      expect(mockPty.write.mock.calls[0][0]).not.toContain('\x1b[201~');
+
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockPty.write.mock.calls.at(-1)?.[0]).toBe('\r');
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('does not blindly inject the startup prompt when TUI readiness is never detected', async () => {
     vi.useFakeTimers();
     try {

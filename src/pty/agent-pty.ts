@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync } from 'fs';
 import { platform } from 'os';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
+import { injectMessage as injectMessageIntoPty } from './inject.js';
 
 // node-pty types
 interface IPty {
@@ -298,6 +299,17 @@ export class AgentPTY {
       throw new Error('PTY not spawned');
     }
     this.pty.write(data);
+  }
+
+  /**
+   * Inject a complete inbound message into the runtime.
+   *
+   * Claude Code accepts bracketed paste reliably, so the base implementation
+   * keeps the historical shared injector. Runtime subclasses can override this
+   * when their TUI has different paste semantics.
+   */
+  injectMessage(content: string): void {
+    injectMessageIntoPty((data) => this.write(data), content);
   }
 
   /**

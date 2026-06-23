@@ -2,8 +2,9 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from '
 import { join } from 'path';
 import { platform } from 'os';
 import { AgentPTY } from './agent-pty.js';
-import { injectMessage } from './inject.js';
+import { KEYS } from './inject.js';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
+import { stripControlChars } from '../utils/validate.js';
 
 const OPENCODE_BOOTSTRAP_PATTERN = '[opencode-pty] ready';
 const OPENCODE_SESSION_MARKER = 'opencode-session.json';
@@ -121,6 +122,28 @@ export class OpencodePTY extends AgentPTY {
     }
   }
 
+  override injectMessage(content: string): void {
+    // OpenCode v1.17.9's TUI does not reliably surface content delivered with
+    // bracketed paste (`ESC[200~ ... ESC[201~`): sandbox validation showed the
+    // shared injector could repaint the screen without the inbound message
+    // reaching the input box. Raw typed input does reach the TUI. Strip terminal
+    // control sequences before typing so external Telegram/bus text cannot
+    // smuggle escape codes now that we intentionally bypass bracketed paste.
+    const safeContent = stripControlChars(content).replace(/\r\n?/g, '\n');
+    const maxChunk = 4096;
+    for (let i = 0; i < safeContent.length; i += maxChunk) {
+      this.write(safeContent.slice(i, i + maxChunk));
+    }
+    setTimeout(() => {
+      try {
+        this.write(KEYS.ENTER);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[opencode-pty] deferred Enter failed (pty likely torn down): ${msg}`);
+      }
+    }, 300).unref?.();
+  }
+
   private injectStartupPromptWhenReady(prompt: string): void {
     let attempts = 0;
     let stableTicks = 0;
@@ -148,7 +171,7 @@ export class OpencodePTY extends AgentPTY {
       if (ready) {
         clearInterval(timer);
         try {
-          injectMessage((data) => this.write(data), prompt);
+          this.injectMessage(prompt);
         } catch {
           // If the TUI exited during startup, AgentProcess exit handling will
           // decide whether to recover. The lost startup prompt is preferable to

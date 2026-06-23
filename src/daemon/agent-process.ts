@@ -6,7 +6,7 @@ import { AgentPTY } from '../pty/agent-pty.js';
 import { CodexAppServerPTY } from '../pty/codex-app-server-pty.js';
 import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
 import { OpencodePTY, opencodeSessionExists } from '../pty/opencode-pty.js';
-import { MessageDedup, injectMessage } from '../pty/inject.js';
+import { MessageDedup, injectMessage as injectMessageIntoPty } from '../pty/inject.js';
 import type { TelegramAPI } from '../telegram/api.js';
 import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
@@ -348,7 +348,13 @@ export class AgentProcess {
       return { ok: false, code: 'DEDUPED', message: `inject for "${this.name}" deduped — content matches MessageDedup hash window` };
     }
 
-    injectMessage((data) => this.pty?.write(data), content);
+    if ('injectMessage' in this.pty && typeof this.pty.injectMessage === 'function') {
+      this.pty.injectMessage(content);
+    } else {
+      // CodexAppServerPTY intentionally models stdin writes itself and does not
+      // inherit AgentPTY. Feed it through the same write path used historically.
+      injectMessageIntoPty((data) => this.pty?.write(data), content);
+    }
     return { ok: true };
   }
 
