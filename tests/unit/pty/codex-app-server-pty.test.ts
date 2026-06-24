@@ -1017,12 +1017,7 @@ describe('CodexAppServerPTY thread lifecycle', () => {
     });
   });
 
-  it('starts a NEW thread in fresh mode even when persisted state exists (treadmill fix)', async () => {
-    // Regression guard: a context-handoff / .force-fresh restart runs in FRESH
-    // mode and MUST NOT resume the persisted thread. Resuming retains the full
-    // context window, so the handoff never lowers usage and the agent re-crosses
-    // the threshold and re-fires — a restart treadmill (cortext-designer PR-A
-    // live validation 2026-06-29). Fresh mode must thread/start a brand-new thread.
+  it('starts a new thread in fresh mode even when persisted thread state exists', async () => {
     fsMocks.existsSync.mockReturnValue(true);
     fsMocks.readFileSync.mockReturnValue(JSON.stringify({
       threadId: 'persisted-fresh-thread',
@@ -1035,6 +1030,7 @@ describe('CodexAppServerPTY thread lifecycle', () => {
 
     await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('fresh');
 
+    expect(requestMock).toHaveBeenCalledTimes(1);
     expect(requestMock).toHaveBeenCalledWith('thread/start', {
       cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
       approvalPolicy: 'never',
@@ -1047,6 +1043,11 @@ describe('CodexAppServerPTY thread lifecycle', () => {
     expect(requestMock).not.toHaveBeenCalledWith(
       'thread/resume',
       expect.anything(),
+    );
+    expect(fsMocks.writeFileSync).toHaveBeenCalledWith(
+      expect.stringContaining('codex-app-server-thread.json'),
+      expect.stringContaining('"threadId": "new-fresh-thread"'),
+      'utf-8',
     );
   });
 });

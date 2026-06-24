@@ -480,12 +480,6 @@ export class CodexAppServerPTY {
   }
 
   private async startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> {
-    // Only resume a persisted thread in CONTINUE mode. A context-handoff /
-    // .force-fresh restart runs in FRESH mode and MUST start a brand-new codex
-    // thread: resuming the persisted thread retains the full context window, so
-    // the handoff never lowers usage, the agent immediately re-crosses the
-    // threshold, and it re-fires — a restart treadmill (caught by cortext-designer
-    // PR-A live validation 2026-06-29; resuming was previously unconditional here).
     if (mode === 'continue') {
       const persisted = this.readThreadState();
       if (persisted) {
