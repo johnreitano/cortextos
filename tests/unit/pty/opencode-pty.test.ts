@@ -273,6 +273,38 @@ describe('OpencodePTY', () => {
     }
   });
 
+  it('adds a strict Telegram send requirement for OpenCode Telegram inbound', async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const pty = new OpencodePTY(mockEnv, {});
+      installSpawnMock(pty);
+      await pty.spawn('fresh', '');
+      mockPty.write.mockClear();
+
+      pty.injectMessage([
+        '=== TELEGRAM from [USER: James] (chat_id:7940429114) ===',
+        '```',
+        'Yo',
+        '```',
+        "Reply using: cortextos bus send-telegram 7940429114 '<your reply>'",
+      ].join('\n'));
+
+      const written = mockPty.write.mock.calls[0][0];
+      expect(written).toContain('=== TELEGRAM from [USER: James] (chat_id:7940429114) ===');
+      expect(written).toContain('[OPENCODE TELEGRAM DELIVERY REQUIREMENT]');
+      expect(written).toContain("cortextos bus send-telegram 7940429114 '<your reply>'");
+      expect(written).toContain('A plain answer printed only in the OpenCode TUI is NOT delivered');
+
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockPty.write.mock.calls.at(-1)?.[0]).toBe('\r');
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('does not blindly inject the startup prompt when TUI readiness is never detected', async () => {
     vi.useFakeTimers();
     try {

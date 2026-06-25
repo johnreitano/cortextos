@@ -13,6 +13,7 @@ const STARTUP_INJECT_MAX_ATTEMPTS = 60;
 const STARTUP_INJECT_INTERVAL_MS = 500;
 const STARTUP_INJECT_MIN_ATTEMPTS = 6;
 const STARTUP_INJECT_STABLE_TICKS = 3;
+const TELEGRAM_HEADER_PATTERN = /^=== TELEGRAM(?:\s+\w+)?\s+from[^\n]*\(chat_id:(-?\d+)\)/;
 
 /**
  * PTY wrapper for OpenCode agents.
@@ -128,7 +129,7 @@ export class OpencodePTY extends AgentPTY {
     // reaching the input box. Raw typed input does reach the TUI. Strip terminal
     // control sequences before typing so external Telegram/bus text cannot
     // smuggle escape codes now that we intentionally bypass bracketed paste.
-    const safeContent = stripControlChars(content).replace(/\r\n?/g, '\n');
+    const safeContent = this.prepareInjectedContent(content);
     const maxChunk = 4096;
     for (let i = 0; i < safeContent.length; i += maxChunk) {
       this.write(safeContent.slice(i, i + maxChunk));
@@ -141,6 +142,23 @@ export class OpencodePTY extends AgentPTY {
         console.warn(`[opencode-pty] deferred Enter failed (pty likely torn down): ${msg}`);
       }
     }, 300).unref?.();
+  }
+
+  private prepareInjectedContent(content: string): string {
+    const safeContent = stripControlChars(content).replace(/\r\n?/g, '\n');
+    const telegramMatch = safeContent.match(TELEGRAM_HEADER_PATTERN);
+    if (!telegramMatch) return safeContent;
+
+    const chatId = telegramMatch[1];
+    return `${safeContent}
+
+[OPENCODE TELEGRAM DELIVERY REQUIREMENT]
+This is a real Telegram inbound message. A plain answer printed only in the OpenCode TUI is NOT delivered to the user and is a failed reply.
+You MUST deliver your response by executing exactly one terminal command:
+
+cortextos bus send-telegram ${chatId} '<your reply>'
+
+Keep the reply concise. Do not just write the answer in the OpenCode chat.`;
   }
 
   private injectStartupPromptWhenReady(prompt: string): void {
