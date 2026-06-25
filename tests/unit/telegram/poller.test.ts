@@ -222,4 +222,23 @@ describe('TelegramPoller — offset-after-handler', () => {
       expect(persisted).toBe('0');
     }
   });
+
+  it('does not convert an intentional stop during an in-flight Conflict into a restartable conflict exit', async () => {
+    let rejectPoll: ((err: Error) => void) | undefined;
+    const api = {
+      getUpdates: vi.fn(() => new Promise((_resolve, reject) => {
+        rejectPoll = reject;
+      })),
+    } as unknown as TelegramAPI;
+    const poller = new TelegramPoller(api, stateDir);
+
+    const running = poller.start();
+    await vi.waitFor(() => expect(api.getUpdates).toHaveBeenCalled());
+
+    poller.stop();
+    rejectPoll?.(new Error('Telegram API error: Conflict: terminated by other getUpdates request'));
+
+    await expect(running).resolves.toBeUndefined();
+    expect(poller.lastExitReason).toBe('stopped-externally');
+  });
 });

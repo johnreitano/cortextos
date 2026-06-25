@@ -92,6 +92,10 @@ export class TelegramPoller {
       try {
         await this.pollOnce();
       } catch (err) {
+        if (!this.running) {
+          this.lastExitReason = 'stopped-externally';
+          return;
+        }
         const msg = err instanceof Error ? err.message : String(err);
         // A 409 Conflict means another getUpdates connection holds the lock
         // (e.g. a not-yet-released connection lingering ~60s after a daemon

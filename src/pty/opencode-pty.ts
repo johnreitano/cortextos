@@ -6,7 +6,7 @@ import { KEYS } from './inject.js';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { stripControlChars } from '../utils/validate.js';
 
-const OPENCODE_BOOTSTRAP_PATTERN = '[opencode-pty] ready';
+const OPENCODE_BOOTSTRAP_PATTERN = 'Ask anything';
 const OPENCODE_SESSION_MARKER = 'opencode-session.json';
 const OPENCODE_PROCESS_MARKER = 'opencode-process.json';
 const STARTUP_INJECT_MAX_ATTEMPTS = 60;
@@ -108,7 +108,6 @@ export class OpencodePTY extends AgentPTY {
     await super.spawn(mode, '');
     this.writeSessionMarker(mode);
     this.writeProcessMarker();
-    this.getOutputBuffer().push(`${OPENCODE_BOOTSTRAP_PATTERN} mode=${mode}\n`);
     if (prompt.trim()) {
       this.injectStartupPromptWhenReady(prompt);
     }

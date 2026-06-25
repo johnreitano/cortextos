@@ -214,7 +214,7 @@ describe('OpencodePTY', () => {
     expect(spawnCall?.options.env.GOOGLE_GENERATIVE_AI_API_KEY).toBe('gemini-secret');
   });
 
-  it('writes a session marker and synthetic bootstrap line after spawn', async () => {
+  it('writes a session marker but does not bootstrap before real TUI readiness', async () => {
     const pty = new OpencodePTY(mockEnv, {});
     installSpawnMock(pty);
     await pty.spawn('fresh', 'boot');
@@ -225,6 +225,9 @@ describe('OpencodePTY', () => {
       expect.stringContaining('"runtime": "opencode"'),
       'utf-8',
     );
+    expect(pty.getOutputBuffer().isBootstrapped()).toBe(false);
+
+    pty.getOutputBuffer().push('Ask anything');
     expect(pty.getOutputBuffer().isBootstrapped()).toBe(true);
   });
 
