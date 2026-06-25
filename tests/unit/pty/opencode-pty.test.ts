@@ -364,6 +364,93 @@ describe('OpencodePTY', () => {
     }
   });
 
+  it('exit-recovers when a cron/heartbeat left the TUI at a real zsh shell prompt', async () => {
+    // Regression for the heartbeat/check-inbox shell bug: OpenCode's own crons
+    // run terminal commands that leave the TUI at a bare `$` prompt. The NEXT
+    // Telegram inbound then lands at zsh (`command not found`) and produces no
+    // reply. Esc alone does not exit that stuck prompt — a typed `exit` does.
+    // When the tail shows a zsh prompt with no chat markers, injection must be
+    // Esc -> (150ms) exit + Enter -> (500ms settle) content -> (300ms) Enter.
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const pty = new OpencodePTY(mockEnv, {});
+      installSpawnMock(pty);
+      await pty.spawn('fresh', '');
+      mockPty.write.mockClear();
+
+      // Simulate the post-cron stuck state: a real zsh prompt at the tail, no
+      // chat readiness markers anywhere near it.
+      pty.getOutputBuffer().push('cortextos bus update-heartbeat\n');
+      pty.getOutputBuffer().push('heartbeat updated\n');
+      pty.getOutputBuffer().push('boris@host cortextos % ');
+
+      pty.injectMessage([
+        '=== TELEGRAM from [USER: James] (chat_id:7940429114) ===',
+        '```',
+        'Yo',
+        '```',
+        "Reply using: cortextos bus send-telegram 7940429114 '<your reply>'",
+      ].join('\n'));
+
+      // Esc fires synchronously.
+      expect(mockPty.write.mock.calls[0][0]).toBe('\x1b');
+
+      // After the 150ms reset delay, the typed exit-recovery fires (NOT content).
+      await vi.advanceTimersByTimeAsync(150);
+      expect(mockPty.write.mock.calls[1][0]).toBe('exit');
+      expect(mockPty.write.mock.calls[2][0]).toBe('\r');
+
+      // Content is typed only after the 500ms shell-exit settle delay.
+      await vi.advanceTimersByTimeAsync(500);
+      const written = mockPty.write.mock.calls[3][0];
+      expect(written).toContain('=== TELEGRAM from [USER: James] (chat_id:7940429114) ===');
+      expect(written).toContain('[OPENCODE TELEGRAM DELIVERY REQUIREMENT]');
+
+      // Then the usual submit Enter.
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockPty.write.mock.calls.at(-1)?.[0]).toBe('\r');
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does NOT type a spurious exit when the TUI tail shows chat readiness', async () => {
+    // The conservative default: when chat markers are present at the tail, even
+    // if a `$`/`%` appears earlier in scrollback, injection stays in chat mode
+    // (Esc -> content -> Enter) and never submits a stray `exit` chat message.
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const pty = new OpencodePTY(mockEnv, {});
+      installSpawnMock(pty);
+      await pty.spawn('fresh', '');
+      mockPty.write.mockClear();
+
+      // A normal chat-ready tail: the input chrome is rendered.
+      pty.getOutputBuffer().push('some earlier shell output $ \n');
+      pty.getOutputBuffer().push('Ask anything\n');
+      pty.getOutputBuffer().push('ctrl+p commands\n');
+
+      pty.injectMessage('hello there');
+
+      expect(mockPty.write.mock.calls[0][0]).toBe('\x1b');
+      await vi.advanceTimersByTimeAsync(150);
+      expect(mockPty.write.mock.calls[1][0]).toBe('hello there');
+      // No `exit` was ever written.
+      expect(mockPty.write.mock.calls.map((call) => call[0])).not.toContain('exit');
+
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockPty.write.mock.calls.at(-1)?.[0]).toBe('\r');
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('does not blindly inject the startup prompt when TUI readiness is never detected', async () => {
     vi.useFakeTimers();
     try {

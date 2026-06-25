@@ -14,6 +14,18 @@ const STARTUP_INJECT_INTERVAL_MS = 500;
 const STARTUP_INJECT_MIN_ATTEMPTS = 6;
 const STARTUP_INJECT_STABLE_TICKS = 3;
 const INJECTION_SHELL_RESET_DELAY_MS = 150;
+// After a typed `exit`, the zsh shell tears down and OpenCode repaints the chat
+// TUI. Give that repaint room before typing the real content, otherwise the
+// content races the shell teardown and lands at the dying prompt.
+const INJECTION_SHELL_EXIT_SETTLE_MS = 500;
+// How many tail lines of cleaned output to inspect when deciding chat vs shell.
+// Shell mode replaces the persistent chat chrome ("Ask anything"), so the
+// decision must look at the live tail, not the whole scrollback.
+const SHELL_DETECT_TAIL_LINES = 20;
+// A zsh prompt line ends in `$`, `%`, or `#` (root) once trailing cursor
+// whitespace is stripped. Used only as the negative fallthrough after chat
+// markers are ruled out.
+const SHELL_PROMPT_TAIL_PATTERN = /[%$#]$/;
 const TELEGRAM_HEADER_PATTERN = /^=== TELEGRAM(?:\s+\w+)?\s+from[^\n]*\(chat_id:(-?\d+)\)/;
 
 /**
@@ -131,17 +143,24 @@ export class OpencodePTY extends AgentPTY {
     // control sequences before typing so external Telegram/bus text cannot
     // smuggle escape codes now that we intentionally bypass bracketed paste.
     //
-    // OpenCode stays in Shell mode after the agent runs a terminal command from
-    // the TUI — which the Telegram reply-protocol forces on every reply
-    // (`cortextos bus send-telegram ...`). If the next inbound is typed
-    // immediately, the whole injected block lands at the zsh prompt instead of
-    // the chat input and is consumed as a shell command (`$ === TELEGRAM ...` ->
-    // command not found), so no model reply is produced. Press Esc before EVERY
-    // injection to exit shell mode / return to chat readiness — we cannot assume
-    // the prior command returned to chat — then type the content after a short
-    // settle delay. Base AgentPTY (Claude/Codex) is unaffected; this override is
-    // OpenCode-only.
+    // OpenCode drops into a real zsh Shell after the agent runs a terminal
+    // command from the TUI — which the Telegram reply-protocol forces on every
+    // reply (`cortextos bus send-telegram ...`) AND which OpenCode's own
+    // heartbeat/check-inbox crons run on their own cadence. Esc alone does NOT
+    // exit that stuck `$` prompt: live probing showed the next inbound then
+    // lands at the zsh prompt (`$ === TELEGRAM ...` -> command not found) and
+    // produces no model reply. The proven recovery is a TYPED `exit` + Enter,
+    // which tears down the shell and repaints the chat TUI.
+    //
+    // But an unconditional `exit` is unsafe — in chat mode it is submitted as a
+    // chat message. So detect the live input mode from the output tail first:
+    // chat readiness markers => chat (type directly, today's behavior); a bare
+    // zsh prompt with no chat markers => shell (exit-recover, then type). The
+    // default is conservative chat, so the worst case is exactly today's
+    // behavior and a spurious `exit` is never typed into a real chat box. Base
+    // AgentPTY (Claude/Codex) is unaffected; this override is OpenCode-only.
     const safeContent = this.prepareInjectedContent(content);
+    const mode = this.detectInputMode();
     try {
       this.write(KEYS.ESCAPE);
     } catch (err) {
@@ -149,6 +168,29 @@ export class OpencodePTY extends AgentPTY {
       console.warn(`[opencode-pty] shell-mode reset (Escape) failed before injection (pty likely torn down): ${msg}`);
       return;
     }
+
+    if (mode === 'shell') {
+      setTimeout(() => {
+        try {
+          this.write('exit');
+          this.write(KEYS.ENTER);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`[opencode-pty] shell exit-recovery failed before injection (pty likely torn down): ${msg}`);
+          return;
+        }
+        setTimeout(() => {
+          try {
+            this.typeAndSubmit(safeContent);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.warn(`[opencode-pty] deferred injection failed after shell exit (pty likely torn down): ${msg}`);
+          }
+        }, INJECTION_SHELL_EXIT_SETTLE_MS).unref?.();
+      }, INJECTION_SHELL_RESET_DELAY_MS).unref?.();
+      return;
+    }
+
     setTimeout(() => {
       try {
         this.typeAndSubmit(safeContent);
@@ -157,6 +199,41 @@ export class OpencodePTY extends AgentPTY {
         console.warn(`[opencode-pty] deferred injection failed (pty likely torn down): ${msg}`);
       }
     }, INJECTION_SHELL_RESET_DELAY_MS).unref?.();
+  }
+
+  /**
+   * Decide whether the OpenCode TUI is currently at the chat input box or has
+   * dropped into a raw zsh shell, by inspecting the tail of recent output.
+   *
+   * Positive chat detection (readiness markers in the tail) wins outright.
+   * Only when those markers are absent AND the last non-empty line looks like a
+   * bare shell prompt do we treat it as shell mode. Anything else defaults to
+   * chat, so a spurious `exit` is never typed into a real chat box.
+   */
+  private detectInputMode(): 'shell' | 'chat' {
+    let recent: string;
+    try {
+      recent = this.getOutputBuffer().getRecent();
+    } catch {
+      return 'chat';
+    }
+
+    const tail = recent
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
+      .split('\n')
+      .filter((line) => !line.trim().startsWith('[opencode-pty]'))
+      .slice(-SHELL_DETECT_TAIL_LINES);
+    const tailText = tail.join('\n');
+
+    if (tailText.includes('Ask anything') || tailText.includes('ctrl+p commands')) {
+      return 'chat';
+    }
+
+    const lastNonEmpty = tail
+      .map((line) => line.replace(/\s+$/, ''))
+      .filter((line) => line.length > 0)
+      .at(-1) ?? '';
+    return SHELL_PROMPT_TAIL_PATTERN.test(lastNonEmpty) ? 'shell' : 'chat';
   }
 
   private typeAndSubmit(safeContent: string): void {
