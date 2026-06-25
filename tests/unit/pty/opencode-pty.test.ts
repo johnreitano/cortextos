@@ -259,11 +259,17 @@ describe('OpencodePTY', () => {
 
       pty.injectMessage('hello\x1b[31m red\rthere');
 
+      // Esc fires first (synchronously) to exit any lingering OpenCode shell mode.
       expect(mockPty.write).toHaveBeenCalledTimes(1);
-      expect(mockPty.write.mock.calls[0][0]).toBe('hello red\nthere');
-      expect(mockPty.write.mock.calls[0][0]).not.toContain('\x1b[200~');
-      expect(mockPty.write.mock.calls[0][0]).not.toContain('\x1b[201~');
+      expect(mockPty.write.mock.calls[0][0]).toBe('\x1b');
 
+      // Content is typed after the shell-reset settle delay.
+      await vi.advanceTimersByTimeAsync(150);
+      expect(mockPty.write.mock.calls[1][0]).toBe('hello red\nthere');
+      expect(mockPty.write.mock.calls[1][0]).not.toContain('\x1b[200~');
+      expect(mockPty.write.mock.calls[1][0]).not.toContain('\x1b[201~');
+
+      // Enter is submitted after the existing 300ms deferral.
       await vi.advanceTimersByTimeAsync(300);
       expect(mockPty.write.mock.calls.at(-1)?.[0]).toBe('\r');
       expect(warnSpy).not.toHaveBeenCalled();
@@ -290,7 +296,11 @@ describe('OpencodePTY', () => {
         "Reply using: cortextos bus send-telegram 7940429114 '<your reply>'",
       ].join('\n'));
 
-      const written = mockPty.write.mock.calls[0][0];
+      // Esc fires first to exit shell mode, then content after the settle delay.
+      expect(mockPty.write.mock.calls[0][0]).toBe('\x1b');
+      await vi.advanceTimersByTimeAsync(150);
+
+      const written = mockPty.write.mock.calls[1][0];
       expect(written).toContain('=== TELEGRAM from [USER: James] (chat_id:7940429114) ===');
       expect(written).toContain('[OPENCODE TELEGRAM DELIVERY REQUIREMENT]');
       expect(written).toContain("cortextos bus send-telegram 7940429114 '<your reply>'");
@@ -298,6 +308,55 @@ describe('OpencodePTY', () => {
 
       await vi.advanceTimersByTimeAsync(300);
       expect(mockPty.write.mock.calls.at(-1)?.[0]).toBe('\r');
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('escapes OpenCode shell mode before every Telegram inbound injection', async () => {
+    // Regression for the multi-turn shell-mode bug: after the agent runs the
+    // reply-protocol `send-telegram` command the TUI is left in shell mode, so
+    // a second inbound must get its own Esc reset before being typed, otherwise
+    // it lands at the zsh prompt and produces no reply. Each injection =
+    // Esc -> (150ms) content -> (300ms) Enter, so advance 450ms per message.
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const pty = new OpencodePTY(mockEnv, {});
+      installSpawnMock(pty);
+      await pty.spawn('fresh', '');
+      mockPty.write.mockClear();
+
+      const firstTelegram = [
+        '=== TELEGRAM from [USER: James] (chat_id:7940429114) ===',
+        '```',
+        'First',
+        '```',
+        "Reply using: cortextos bus send-telegram 7940429114 '<your reply>'",
+      ].join('\n');
+      const secondTelegram = [
+        '=== TELEGRAM from [USER: James] (chat_id:7940429114) ===',
+        '```',
+        'Second after shell command',
+        '```',
+        "Reply using: cortextos bus send-telegram 7940429114 '<your reply>'",
+      ].join('\n');
+
+      pty.injectMessage(firstTelegram);
+      await vi.advanceTimersByTimeAsync(450);
+      pty.injectMessage(secondTelegram);
+      await vi.advanceTimersByTimeAsync(450);
+
+      expect(mockPty.write.mock.calls.map((call) => call[0])).toEqual([
+        '\x1b',
+        expect.stringContaining('First'),
+        '\r',
+        '\x1b',
+        expect.stringContaining('Second after shell command'),
+        '\r',
+      ]);
       expect(warnSpy).not.toHaveBeenCalled();
     } finally {
       warnSpy.mockRestore();

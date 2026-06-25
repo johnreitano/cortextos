@@ -13,6 +13,7 @@ const STARTUP_INJECT_MAX_ATTEMPTS = 60;
 const STARTUP_INJECT_INTERVAL_MS = 500;
 const STARTUP_INJECT_MIN_ATTEMPTS = 6;
 const STARTUP_INJECT_STABLE_TICKS = 3;
+const INJECTION_SHELL_RESET_DELAY_MS = 150;
 const TELEGRAM_HEADER_PATTERN = /^=== TELEGRAM(?:\s+\w+)?\s+from[^\n]*\(chat_id:(-?\d+)\)/;
 
 /**
@@ -129,7 +130,36 @@ export class OpencodePTY extends AgentPTY {
     // reaching the input box. Raw typed input does reach the TUI. Strip terminal
     // control sequences before typing so external Telegram/bus text cannot
     // smuggle escape codes now that we intentionally bypass bracketed paste.
+    //
+    // OpenCode stays in Shell mode after the agent runs a terminal command from
+    // the TUI — which the Telegram reply-protocol forces on every reply
+    // (`cortextos bus send-telegram ...`). If the next inbound is typed
+    // immediately, the whole injected block lands at the zsh prompt instead of
+    // the chat input and is consumed as a shell command (`$ === TELEGRAM ...` ->
+    // command not found), so no model reply is produced. Press Esc before EVERY
+    // injection to exit shell mode / return to chat readiness — we cannot assume
+    // the prior command returned to chat — then type the content after a short
+    // settle delay. Base AgentPTY (Claude/Codex) is unaffected; this override is
+    // OpenCode-only.
     const safeContent = this.prepareInjectedContent(content);
+    try {
+      this.write(KEYS.ESCAPE);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[opencode-pty] shell-mode reset (Escape) failed before injection (pty likely torn down): ${msg}`);
+      return;
+    }
+    setTimeout(() => {
+      try {
+        this.typeAndSubmit(safeContent);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[opencode-pty] deferred injection failed (pty likely torn down): ${msg}`);
+      }
+    }, INJECTION_SHELL_RESET_DELAY_MS).unref?.();
+  }
+
+  private typeAndSubmit(safeContent: string): void {
     const maxChunk = 4096;
     for (let i = 0; i < safeContent.length; i += maxChunk) {
       this.write(safeContent.slice(i, i + maxChunk));
