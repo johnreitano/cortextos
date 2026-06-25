@@ -106,6 +106,62 @@ describe('context monitor tier selection', () => {
   });
 });
 
+// --- Handoff grace window (fresh-session false-100% loop guard) ---
+
+describe('handoff grace window', () => {
+  const WARN = 70;
+  const HANDOFF = 80;
+  const HANDOFF_GRACE_MS = 120_000;
+
+  // Mirrors fast-checker tier selection with the grace guard added: a session
+  // younger than HANDOFF_GRACE_MS suppresses warning + handoff so a transient
+  // false-high reading on a fresh session cannot trigger a handoff→restart loop.
+  function selectTierWithGrace(
+    pct: number | null,
+    exceeds: boolean,
+    warningFiredAt: number,
+    handoffFiredAt: number,
+    now: number,
+    sessionStartedAt: number,
+  ) {
+    const effectivePct = pct !== null ? pct : (exceeds ? 101 : null);
+    if (effectivePct === null) return 'none';
+    const withinGrace = sessionStartedAt > 0 && now - sessionStartedAt < HANDOFF_GRACE_MS;
+    if (effectivePct >= HANDOFF && handoffFiredAt === 0 && !withinGrace) return 'handoff';
+    if (effectivePct >= WARN && !withinGrace && now - warningFiredAt > 15 * 60_000) return 'warning';
+    return 'none';
+  }
+
+  it('100% within grace of a fresh session does NOT fire handoff (breaks false-100% loop)', () => {
+    const now = Date.now();
+    const sessionStartedAt = now - 30_000; // 30s into session, inside 2min grace
+    expect(selectTierWithGrace(100, false, 0, 0, now, sessionStartedAt)).toBe('none');
+  });
+
+  it('exceeds_200k within grace does NOT fire handoff', () => {
+    const now = Date.now();
+    const sessionStartedAt = now - 10_000;
+    expect(selectTierWithGrace(null, true, 0, 0, now, sessionStartedAt)).toBe('none');
+  });
+
+  it('100% after grace expires DOES fire handoff (genuine sustained overflow still acts)', () => {
+    const now = Date.now();
+    const sessionStartedAt = now - 3 * 60_000; // 3min old, past 2min grace
+    expect(selectTierWithGrace(100, false, 0, 0, now, sessionStartedAt)).toBe('handoff');
+  });
+
+  it('warning within grace is also suppressed', () => {
+    const now = Date.now();
+    const sessionStartedAt = now - 30_000;
+    expect(selectTierWithGrace(75, false, 0, 0, now, sessionStartedAt)).toBe('none');
+  });
+
+  it('unset sessionStartedAt (0) imposes no grace — preserves prior behavior', () => {
+    const now = Date.now();
+    expect(selectTierWithGrace(80, false, 0, 0, now, 0)).toBe('handoff');
+  });
+});
+
 // --- Warning deduplication ---
 
 describe('warning deduplication', () => {
