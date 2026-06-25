@@ -67,8 +67,7 @@ export class AgentProcess {
   private telegramChatId: string | null = null;
   // Issue #392: tracks whether the most recently built startup prompt consumed
   // a handoff doc marker. start() reads this after spawn to decide whether the
-  // daemon should fire the codex-app-server back-online Telegram directly
-  // (skipped on handoff restart — the agent sends its own contextual reply).
+  // daemon should fire runtime-owned lifecycle Telegram directly.
   private lastSpawnWasHandoff = false;
 
   constructor(name: string, env: CtxEnv, config: AgentConfig, log?: LogFn) {
@@ -185,12 +184,7 @@ export class AgentProcess {
       this.sessionStart = new Date();
       this.log(`Running (pid: ${this.pty.getPid()})`);
 
-      // Issue #392: codex-app-server does not reliably execute the inline
-      // "Send a Telegram message saying you are back online" instruction the
-      // way claude-code does, so fire the back-online ping directly from the
-      // daemon for that runtime. Skipped on handoff restart — the agent
-      // sends its own contextual "back — ..." reply in that case.
-      this.maybeSendCodexBootNotification();
+      this.maybeSendRuntimeLifecycleNotification();
 
       // Start session timer
       this.startSessionTimer();
@@ -821,25 +815,36 @@ export class AgentProcess {
   }
 
   /**
-   * Issue #392: send the back-online Telegram notification directly from the
-   * daemon when the codex-app-server runtime spawns. The boot prompt's inline
-   * "Send a Telegram message..." instruction reaches the codex thread but is
-   * not executed reliably as a tool call, leaving James without the standard
-   * post-restart notification claude-code peers send.
+   * Issue #392 / OpenCode parity: send lifecycle Telegram directly from the
+   * daemon for runtimes whose startup/continue prompts are not reliable enough
+   * to guarantee a user-visible notification.
+   *
+   * codex-app-server: the boot prompt's inline "Send a Telegram message..."
+   * instruction reaches the codex thread but is not executed reliably as a tool
+   * call, leaving James without the standard post-restart notification
+   * claude-code peers send.
+   *
+   * opencode: the prompt is injected into the persistent TUI after startup.
+   * Real production evidence showed an OpenCode --continue restart updated the
+   * process/session markers but emitted no Telegram message, so lifecycle
+   * visibility must be daemon-owned just like Codex.
    *
    * Skipped when:
-   *  - runtime is anything other than codex-app-server (claude-code/hermes
-   *    already emit this via the prompt),
-   *  - the most recent prompt was built for a handoff restart (the agent
-   *    sends its own contextual "back — ..." reply in that case),
-   *  - no Telegram handle has been wired (no chat_id configured).
+   *  - runtime is anything other than codex-app-server/opencode (claude-code
+   *    and hermes already emit this via the prompt),
+   *  - handoff restarts (the agent sends its own contextual "back — ..." reply
+   *    in that case),
+   *  - Telegram is disabled or no Telegram handle has been wired.
    */
-  private maybeSendCodexBootNotification(): void {
-    if (this.config.runtime !== 'codex-app-server') return;
+  private maybeSendRuntimeLifecycleNotification(): void {
+    if (this.config.runtime !== 'codex-app-server' && this.config.runtime !== 'opencode') return;
     if (this.lastSpawnWasHandoff) return;
-    if (!this.telegramApi || !this.telegramChatId) return;
-    this.telegramApi
-      .sendMessage(this.telegramChatId, `Agent ${this.name} is back online`)
+    if (!this.shouldPromptTelegramOnlineMessage()) return;
+    const telegramApi = this.telegramApi;
+    const telegramChatId = this.telegramChatId;
+    if (!telegramApi || !telegramChatId) return;
+    telegramApi
+      .sendMessage(telegramChatId, `Agent ${this.name} is back online`)
       .catch(() => { /* non-fatal: notification is observability only */ });
   }
 

@@ -138,13 +138,15 @@ describe('AgentProcess opencode runtime', () => {
       runtime: 'opencode',
       telegram_polling: false,
     });
+    const sendMessage = vi.fn().mockResolvedValue(undefined);
 
-    ap.setTelegramHandle({ sendChatAction: vi.fn().mockResolvedValue(undefined) } as any, '12345');
+    ap.setTelegramHandle({ sendChatAction: vi.fn().mockResolvedValue(undefined), sendMessage } as any, '12345');
     await ap.start();
 
     const prompt = mockOpencodePty.spawn.mock.calls[0]?.[1] ?? '';
     expect(prompt).not.toContain('send a Telegram message');
     expect(prompt).not.toContain('Send a Telegram message');
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 
   it('prompts Telegram-enabled opencode agents to send back-online Telegram on fresh start', async () => {
@@ -157,6 +159,17 @@ describe('AgentProcess opencode runtime', () => {
     expect(prompt).toContain('Send a Telegram message to the user saying you are back online.');
   });
 
+  it('sends daemon-direct back-online Telegram for opencode fresh start', async () => {
+    const ap = new AgentProcess('opencode-agent', mockEnv, { runtime: 'opencode' });
+    const sendMessage = vi.fn().mockResolvedValue(undefined);
+    const api = { sendChatAction: vi.fn().mockResolvedValue(undefined), sendMessage };
+
+    ap.setTelegramHandle(api as any, '12345');
+    await ap.start();
+
+    expect(sendMessage).toHaveBeenCalledWith('12345', 'Agent opencode-agent is back online');
+  });
+
   it('prompts Telegram-enabled opencode agents to send back-online Telegram on continue start', async () => {
     mockOpencodeSessionExists.mockReturnValue(true);
     const ap = new AgentProcess('opencode-agent', mockEnv, { runtime: 'opencode' });
@@ -167,6 +180,39 @@ describe('AgentProcess opencode runtime', () => {
     const prompt = mockOpencodePty.spawn.mock.calls[0]?.[1] ?? '';
     expect(mockOpencodePty.spawn).toHaveBeenCalledWith('continue', expect.any(String));
     expect(prompt).toContain('After checking inbox, send a Telegram message to the user saying you are back online.');
+  });
+
+  it('sends daemon-direct back-online Telegram for opencode continue start', async () => {
+    mockOpencodeSessionExists.mockReturnValue(true);
+    const ap = new AgentProcess('opencode-agent', mockEnv, { runtime: 'opencode' });
+    const sendMessage = vi.fn().mockResolvedValue(undefined);
+    const api = { sendChatAction: vi.fn().mockResolvedValue(undefined), sendMessage };
+
+    ap.setTelegramHandle(api as any, '12345');
+    await ap.start();
+
+    expect(mockOpencodePty.spawn).toHaveBeenCalledWith('continue', expect.any(String));
+    expect(sendMessage).toHaveBeenCalledWith('12345', 'Agent opencode-agent is back online');
+  });
+
+  it('skips daemon-direct back-online Telegram on opencode handoff restart', async () => {
+    const handoffDocPath = '/tmp/opencode-handoff.md';
+    fsMocks.existsSync.mockImplementation((path: string) =>
+      typeof path === 'string'
+      && (path.endsWith('.handoff-doc-path') || path === handoffDocPath),
+    );
+    fsMocks.readFileSync.mockReturnValue(handoffDocPath);
+
+    const ap = new AgentProcess('opencode-agent', mockEnv, { runtime: 'opencode' });
+    const sendMessage = vi.fn().mockResolvedValue(undefined);
+    const api = { sendChatAction: vi.fn().mockResolvedValue(undefined), sendMessage };
+
+    ap.setTelegramHandle(api as any, '12345');
+    await ap.start();
+
+    const prompt = mockOpencodePty.spawn.mock.calls[0]?.[1] ?? '';
+    expect(prompt).toContain('CONTEXT HANDOFF');
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 
   it('does not use Claude /exit choreography on stop', async () => {
