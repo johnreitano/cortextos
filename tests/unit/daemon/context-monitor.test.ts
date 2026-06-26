@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdirSync, writeFileSync, unlinkSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { handoffGraceMs } from '../../../src/daemon/fast-checker.js';
 
 /**
  * Unit tests for the context monitor logic in fast-checker.ts.
@@ -162,6 +163,45 @@ describe('handoff grace window', () => {
   });
 });
 
+// --- Runtime-aware grace window (laggy codex/opencode prompt-cache spike) ---
+
+describe('handoffGraceMs runtime-aware grace window', () => {
+  it('codex-app-server gets the extended 10min grace', () => {
+    expect(handoffGraceMs('codex-app-server')).toBe(600_000);
+  });
+
+  it('opencode gets the extended 10min grace', () => {
+    expect(handoffGraceMs('opencode')).toBe(600_000);
+  });
+
+  it('claude-code keeps the 2min grace', () => {
+    expect(handoffGraceMs('claude-code')).toBe(120_000);
+  });
+
+  it('hermes keeps the 2min grace', () => {
+    expect(handoffGraceMs('hermes')).toBe(120_000);
+  });
+
+  it('undefined runtime keeps the 2min grace', () => {
+    expect(handoffGraceMs(undefined)).toBe(120_000);
+  });
+
+  it('a spurious 100% spike at T+5min within codex extended grace is suppressed, but a claude session past its 2min grace fires', () => {
+    const now = Date.now();
+    const sessionStartedAt = now - 5 * 60_000; // 5min into session
+
+    // codex: 5min < 10min grace -> still within grace -> suppressed
+    const codexWithinGrace =
+      sessionStartedAt > 0 && now - sessionStartedAt < handoffGraceMs('codex-app-server');
+    expect(codexWithinGrace).toBe(true);
+
+    // claude: 5min > 2min grace -> past grace -> a genuine high reading would act
+    const claudeWithinGrace =
+      sessionStartedAt > 0 && now - sessionStartedAt < handoffGraceMs('claude-code');
+    expect(claudeWithinGrace).toBe(false);
+  });
+});
+
 // --- Warning deduplication ---
 
 describe('warning deduplication', () => {
@@ -222,7 +262,7 @@ describe('context monitor circuit breaker', () => {
 // --- Overflow-banner backstop self-referential guard ---
 
 describe('overflow-banner backstop corroboration guard', () => {
-  // Mirrors the hard overflow backstop in fast-checker.ts (~line 977). The PTY
+  // Mirrors the hard overflow backstop in fast-checker.ts (~line 1021). The PTY
   // banner regex is a backstop that force-restarts when Claude's live context-
   // overflow banner appears in an agent's terminal. Without the
   // ctxCorroboratesOverflow gate, the regex matched those banner phrases as benign
