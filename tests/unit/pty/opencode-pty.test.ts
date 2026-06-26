@@ -242,7 +242,37 @@ describe('OpencodePTY', () => {
       pty.getOutputBuffer().push('OpenCode rendered frame\n');
       await vi.advanceTimersByTimeAsync(STARTUP_TICKS(9));
 
-      expect(mockPty.write.mock.calls.map((call) => call[0]).join('')).toContain('boot prompt');
+      const written = mockPty.write.mock.calls.map((call) => call[0]).join('');
+      expect(written).toContain('boot prompt');
+      expect(written).toContain('[OPENCODE STARTUP EXECUTION REQUIREMENT]');
+      expect(written).toContain('Execute it now as the next model turn');
+
+      await vi.advanceTimersByTimeAsync(300);
+      expect(mockPty.write.mock.calls.at(-1)?.[0]).toBe('\r');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('submits the startup prompt reliably across repeated fresh boots', async () => {
+    vi.useFakeTimers();
+    try {
+      for (let i = 0; i < 4; i++) {
+        const pty = new OpencodePTY(mockEnv, {});
+        installSpawnMock(pty);
+        await pty.spawn('fresh', `handoff prompt ${i}`);
+
+        pty.getOutputBuffer().push('Ask anything\n');
+        await vi.advanceTimersByTimeAsync(STARTUP_TICKS(1));
+        await vi.advanceTimersByTimeAsync(150);
+        await vi.advanceTimersByTimeAsync(300);
+      }
+
+      const writes = mockPty.write.mock.calls.map((call) => call[0]);
+      for (let i = 0; i < 4; i++) {
+        expect(writes).toContainEqual(expect.stringContaining(`handoff prompt ${i}`));
+      }
+      expect(writes.filter((write) => write === '\r')).toHaveLength(4);
     } finally {
       vi.useRealTimers();
     }

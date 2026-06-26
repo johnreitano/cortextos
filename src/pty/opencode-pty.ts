@@ -135,7 +135,7 @@ export class OpencodePTY extends AgentPTY {
     this.writeProcessMarker();
     this.startContextReporter(mode);
     if (prompt.trim()) {
-      this.injectStartupPromptWhenReady(prompt);
+      this.injectStartupPromptWhenReady(this.prepareStartupPrompt(prompt));
     }
   }
 
@@ -288,6 +288,15 @@ You MUST deliver your response by executing exactly one terminal command:
 cortextos bus send-telegram ${chatId} '<your reply>'
 
 Keep the reply concise. Do not just write the answer in the OpenCode chat.`;
+  }
+
+  private prepareStartupPrompt(prompt: string): string {
+    const safePrompt = stripControlChars(prompt).replace(/\r\n?/g, '\n').trim();
+    return `${safePrompt}
+
+[OPENCODE STARTUP EXECUTION REQUIREMENT]
+The text above is a live startup instruction message, not passive context or a session title. Execute it now as the next model turn.
+If it instructs you to send Telegram or bus output, run the required terminal command now. Do not wait for another inbound message.`;
   }
 
   private injectStartupPromptWhenReady(prompt: string): void {
