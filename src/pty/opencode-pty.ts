@@ -3,6 +3,7 @@ import { join } from 'path';
 import { platform } from 'os';
 import { AgentPTY } from './agent-pty.js';
 import { KEYS } from './inject.js';
+import { OpencodeContextReporter } from './opencode-context-reporter.js';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { stripControlChars } from '../utils/validate.js';
 
@@ -13,6 +14,7 @@ const STARTUP_INJECT_MAX_ATTEMPTS = 60;
 const STARTUP_INJECT_INTERVAL_MS = 500;
 const STARTUP_INJECT_MIN_ATTEMPTS = 6;
 const STARTUP_INJECT_STABLE_TICKS = 3;
+const CONTEXT_REPORT_INTERVAL_MS = 5000;
 const INJECTION_SHELL_RESET_DELAY_MS = 150;
 // After a typed `exit`, the zsh shell tears down and OpenCode repaints the chat
 // TUI. Give that repaint room before typing the real content, otherwise the
@@ -50,11 +52,17 @@ const TELEGRAM_HEADER_PATTERN = /^=== TELEGRAM(?:\s+\w+)?\s+from[^\n]*\(chat_id:
 export class OpencodePTY extends AgentPTY {
   private stateDir: string;
   private agentDir: string;
+  private workingDir: string;
+  private opencodeStateRoot: string;
+  private contextReporter: OpencodeContextReporter | null = null;
+  private contextReportTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(env: CtxEnv, config: AgentConfig, logPath?: string) {
     super(env, config, logPath, OPENCODE_BOOTSTRAP_PATTERN);
     this.agentDir = env.agentDir;
+    this.workingDir = config.working_directory || env.agentDir || process.cwd();
     this.stateDir = join(env.ctxRoot, 'state', env.agentName);
+    this.opencodeStateRoot = join(this.stateDir, 'opencode');
   }
 
   protected getBinaryName(): string {
@@ -91,6 +99,7 @@ export class OpencodePTY extends AgentPTY {
 
   protected customizeEnv(env: Record<string, string>): void {
     const opencodeStateRoot = env['OPENCODE_XDG_ROOT'] || join(this.stateDir, 'opencode');
+    this.opencodeStateRoot = opencodeStateRoot;
     const xdgDirs = {
       XDG_DATA_HOME: join(opencodeStateRoot, 'data'),
       XDG_CONFIG_HOME: join(opencodeStateRoot, 'config'),
@@ -122,6 +131,7 @@ export class OpencodePTY extends AgentPTY {
     await super.spawn(mode, '');
     this.writeSessionMarker(mode);
     this.writeProcessMarker();
+    this.startContextReporter();
     if (prompt.trim()) {
       this.injectStartupPromptWhenReady(prompt);
     }
@@ -129,6 +139,7 @@ export class OpencodePTY extends AgentPTY {
 
   override kill(): void {
     try {
+      this.stopContextReporter();
       super.kill();
     } finally {
       this.removeProcessMarker();
@@ -330,6 +341,30 @@ Keep the reply concise. Do not just write the answer in the OpenCode chat.`;
     } catch {
       // Non-fatal: missing marker only makes the next boot start fresh.
     }
+  }
+
+  private startContextReporter(): void {
+    this.stopContextReporter();
+    this.contextReporter = new OpencodeContextReporter({
+      stateDir: this.stateDir,
+      agentDir: this.agentDir,
+      workingDir: this.workingDir,
+      opencodeStateRoot: this.opencodeStateRoot,
+      config: this.config,
+    });
+    this.contextReporter.reportOnce();
+    this.contextReportTimer = setInterval(() => {
+      this.contextReporter?.reportOnce();
+    }, CONTEXT_REPORT_INTERVAL_MS);
+    this.contextReportTimer.unref?.();
+  }
+
+  private stopContextReporter(): void {
+    if (this.contextReportTimer) {
+      clearInterval(this.contextReportTimer);
+      this.contextReportTimer = null;
+    }
+    this.contextReporter = null;
   }
 
   private processMarkerPath(): string {
