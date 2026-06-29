@@ -17,6 +17,9 @@ const mockOpencodePty = {
 const mockAgentPty = {
   ...mockOpencodePty,
   getPid: vi.fn().mockReturnValue(12345),
+  // CodexAppServerPTY exposes setTelegramHandle; start() calls it when a codex
+  // agent has a Telegram handle wired (src/daemon/agent-process.ts).
+  setTelegramHandle: vi.fn(),
 };
 
 const mockOpencodeSessionExists = vi.fn().mockReturnValue(false);
@@ -195,13 +198,19 @@ describe('AgentProcess opencode runtime', () => {
     expect(sendMessage).toHaveBeenCalledWith('12345', 'Agent opencode-agent is back online');
   });
 
-  it('sends daemon-direct handoff Telegram on opencode handoff restart (deepseek does not self-send)', async () => {
+  it('sends both msg1 (planned-restart) and msg2 (back-online) on opencode handoff restart', async () => {
     const handoffDocPath = '/tmp/opencode-handoff.md';
     fsMocks.existsSync.mockImplementation((path: string) =>
       typeof path === 'string'
-      && (path.endsWith('.handoff-doc-path') || path === handoffDocPath),
+      && (path.endsWith('.handoff-doc-path')
+        || path.endsWith('.restart-planned')
+        || path === handoffDocPath),
     );
-    fsMocks.readFileSync.mockReturnValue(handoffDocPath);
+    fsMocks.readFileSync.mockImplementation((path: string) =>
+      typeof path === 'string' && path.endsWith('.restart-planned')
+        ? 'context handoff at 92%\n'
+        : handoffDocPath,
+    );
 
     const ap = new AgentProcess('opencode-agent', mockEnv, { runtime: 'opencode' });
     const sendMessage = vi.fn().mockResolvedValue(undefined);
@@ -212,9 +221,42 @@ describe('AgentProcess opencode runtime', () => {
 
     const prompt = mockOpencodePty.spawn.mock.calls[0]?.[1] ?? '';
     expect(prompt).toContain('CONTEXT HANDOFF');
-    // Unlike codex-app-server, opencode (deepseek) does NOT execute the injected
-    // boot-prompt notification, so the daemon must send a handoff-flavored ping.
+    // msg1: hook parity — codex/opencode don't run Claude Code hooks, so the
+    // daemon emits the planned-restart lifecycle notif itself.
+    expect(sendMessage).toHaveBeenCalledWith('12345', '🔄 opencode-agent restarted (planned): context handoff at 92%');
+    // msg2: opencode (deepseek) does NOT self-send a contextual "back — ..."
+    // reply, so the daemon also sends a back-online ping.
     expect(sendMessage).toHaveBeenCalledWith('12345', 'Agent opencode-agent is back online (context handoff)');
+  });
+
+  it('sends msg1 (planned-restart) but NOT msg2 on codex handoff restart (codex self-sends its own back-online)', async () => {
+    const handoffDocPath = '/tmp/codex-handoff.md';
+    fsMocks.existsSync.mockImplementation((path: string) =>
+      typeof path === 'string'
+      && (path.endsWith('.handoff-doc-path')
+        || path.endsWith('.restart-planned')
+        || path === handoffDocPath),
+    );
+    fsMocks.readFileSync.mockImplementation((path: string) =>
+      typeof path === 'string' && path.endsWith('.restart-planned')
+        ? 'context handoff at 88%\n'
+        : handoffDocPath,
+    );
+
+    const ap = new AgentProcess('codex-agent', mockEnv, { runtime: 'codex-app-server' });
+    const sendMessage = vi.fn().mockResolvedValue(undefined);
+    const api = { sendChatAction: vi.fn().mockResolvedValue(undefined), sendMessage };
+
+    ap.setTelegramHandle(api as any, '12345');
+    await ap.start();
+
+    // msg1: daemon-emitted hook parity, same as opencode.
+    expect(sendMessage).toHaveBeenCalledWith('12345', '🔄 codex-agent restarted (planned): context handoff at 88%');
+    // msg2: codex reliably self-sends its own "back — ..." reply, so the daemon
+    // must NOT also send a back-online ping (that would double up).
+    expect(sendMessage).not.toHaveBeenCalledWith('12345', 'Agent codex-agent is back online (context handoff)');
+    expect(sendMessage).not.toHaveBeenCalledWith('12345', 'Agent codex-agent is back online');
+    expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it('does not use Claude /exit choreography on stop', async () => {

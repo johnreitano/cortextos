@@ -829,29 +829,66 @@ export class AgentProcess {
    * process/session markers but emitted no Telegram message, so lifecycle
    * visibility must be daemon-owned just like Codex.
    *
+   * Two distinct notifications, mirroring what a claude-code agent emits:
+   *  - msg1 (planned-restart lifecycle, "🔄 <agent> restarted (planned): ..."):
+   *    for claude this is sent by hook-crash-alert.ts on PTY exit. codex/opencode
+   *    runtimes do NOT run Claude Code hooks, so on a handoff restart the daemon
+   *    emits the same notification here for parity (James saw msg1 only for
+   *    claude agents otherwise). Format mirrors hook-crash-alert.ts:394-397.
+   *  - msg2 (back-online / "back — ..." summary): codex reliably self-sends its
+   *    own contextual reply via the boot prompt; opencode (deepseek) does NOT, so
+   *    the daemon sends a handoff-flavored back-online ping for opencode only.
+   *
    * Skipped when:
    *  - runtime is anything other than codex-app-server/opencode (claude-code
-   *    and hermes already emit this via the prompt),
-   *  - handoff restarts ON codex-app-server ONLY (codex reliably self-sends its
-   *    own contextual "back — ..." reply on handoff). opencode (deepseek model)
-   *    does NOT execute the injected boot-prompt instruction, so it goes silent
-   *    on every context-handoff restart — for opencode the daemon sends a
-   *    handoff-flavored notification itself,
+   *    and hermes already emit both via the hook + prompt),
    *  - Telegram is disabled or no Telegram handle has been wired.
    */
   private maybeSendRuntimeLifecycleNotification(): void {
     if (this.config.runtime !== 'codex-app-server' && this.config.runtime !== 'opencode') return;
-    if (this.lastSpawnWasHandoff && this.config.runtime !== 'opencode') return;
     if (!this.shouldPromptTelegramOnlineMessage()) return;
     const telegramApi = this.telegramApi;
     const telegramChatId = this.telegramChatId;
     if (!telegramApi || !telegramChatId) return;
-    const message = this.lastSpawnWasHandoff
-      ? `Agent ${this.name} is back online (context handoff)`
-      : `Agent ${this.name} is back online`;
-    telegramApi
-      .sendMessage(telegramChatId, message)
-      .catch(() => { /* non-fatal: notification is observability only */ });
+    const send = (text: string) =>
+      telegramApi
+        .sendMessage(telegramChatId, text)
+        .catch(() => { /* non-fatal: notification is observability only */ });
+
+    if (this.lastSpawnWasHandoff) {
+      // msg1: planned-restart lifecycle notif, hook parity for runtimes without
+      // Claude Code hooks. Both codex and opencode were missing this.
+      send(this.buildPlannedRestartNotification());
+      // msg2: opencode can't self-send a contextual "back — ..." reply, so the
+      // daemon sends a back-online ping. codex self-sends its own, so skip it.
+      if (this.config.runtime === 'opencode') {
+        send(`Agent ${this.name} is back online (context handoff)`);
+      }
+      return;
+    }
+
+    // Non-handoff restart (crash recovery / config reload): both runtimes need
+    // the daemon-emitted back-online ping.
+    send(`Agent ${this.name} is back online`);
+  }
+
+  /**
+   * Build the planned-restart lifecycle notification (msg1) for codex/opencode,
+   * reading the reason from the `.restart-planned` marker and matching the
+   * hook-crash-alert.ts:394-397 format string exactly so codex/opencode parity
+   * is byte-identical to what claude agents emit via the hook.
+   */
+  private buildPlannedRestartNotification(): string {
+    let reason = '';
+    try {
+      const markerPath = join(this.env.ctxRoot, 'state', this.name, '.restart-planned');
+      if (existsSync(markerPath)) {
+        reason = readFileSync(markerPath, 'utf-8').trim();
+      }
+    } catch { /* non-fatal — fall through to generic reason */ }
+    return reason.startsWith('CONTEXT-FORCE-RESTART')
+      ? `🔄 ${this.name} restarting with memory`
+      : `🔄 ${this.name} restarted (planned): ${reason || 'no reason given'}`;
   }
 
   private startSessionTimer(): void {
