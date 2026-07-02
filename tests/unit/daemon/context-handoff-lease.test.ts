@@ -66,7 +66,9 @@ describe('context handoff fleet lease', () => {
 
   it('limits actual FastChecker handoff prompts when six agents cross at once', async () => {
     const agents = ['agent-a', 'agent-b', 'agent-c', 'agent-d', 'agent-e', 'agent-f'];
-    const records = agents.map((agentName) => createChecker(agentName));
+    // pct must cross the default 60% handoff threshold (this test predates the
+    // 40% -> 60% default change and relied on createChecker's 50% default).
+    const records = agents.map((agentName) => createChecker(agentName, { pct: 70 }));
 
     await Promise.all(records.map((record) =>
       (record.checker as any).checkContextStatus()));
