@@ -211,6 +211,43 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     const cfg = JSON.parse(readFileSync(join(agentDir, 'config.json'), 'utf-8'));
     expect(cfg.runtime).toBe('claude-code');
   });
+
+  it('scaffolds runtime=opencode with the OpenCode-native template and local skill links', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await addAgentCommand.parseAsync([
+      'node', 'cli', 'opencode-test', '--runtime', 'opencode',
+      '--org', 'testorg', '--instance', 'pr02-test',
+    ]);
+
+    const agentDir = join(tempRoot, 'orgs', 'testorg', 'agents', 'opencode-test');
+    expect(existsSync(agentDir)).toBe(true);
+
+    // OpenCode gets its own runtime-native template, not the Claude PTY fallback.
+    expect(existsSync(join(agentDir, '.claude', 'skills'))).toBe(false);
+    expect(existsSync(join(agentDir, 'AGENTS.md'))).toBe(true);
+    expect(existsSync(join(agentDir, '.opencode', 'opencode.json'))).toBe(true);
+    expect(existsSync(join(agentDir, '.opencode', 'commands', 'setup.md'))).toBe(true);
+    expect(existsSync(join(agentDir, '.opencode', 'commands', 'runtime-validation.md'))).toBe(true);
+
+    const cfg = JSON.parse(readFileSync(join(agentDir, 'config.json'), 'utf-8'));
+    expect(cfg.runtime).toBe('opencode');
+    expect(cfg.model).toBe('openai/gpt-4.1-nano');
+    expect(cfg.dangerously_skip_permissions).toBe(true);
+
+    const agentsMd = readFileSync(join(agentDir, 'AGENTS.md'), 'utf-8');
+    expect(agentsMd.slice(0, 1500)).toMatch(/OpenCode agent/);
+    expect(agentsMd.slice(0, 1500)).toMatch(/cortextos bus send-telegram/);
+
+    const opencodeSkillsDir = join(agentDir, '.opencode', 'skills');
+    expect(existsSync(opencodeSkillsDir)).toBe(true);
+    const links = readdirSync(opencodeSkillsDir).filter(n => n !== '.gitkeep');
+    expect(links.length).toBe(23);
+    for (const link of links) {
+      expect(lstatSync(join(opencodeSkillsDir, link)).isSymbolicLink()).toBe(true);
+    }
+  });
 });
 
 /**

@@ -5,7 +5,7 @@ import { homedir } from 'os';
 import { OrgContext } from '../types';
 import { validateAgentName, validateOrgName } from '../utils/validate';
 
-const VALID_RUNTIMES = ['claude-code', 'hermes', 'codex-app-server'] as const;
+const VALID_RUNTIMES = ['claude-code', 'hermes', 'codex-app-server', 'opencode'] as const;
 type RuntimeKind = typeof VALID_RUNTIMES[number];
 
 // Templates that don't have a codex variant yet. Pairing any of these with
@@ -106,16 +106,19 @@ export const addAgentCommand = new Command('add-agent')
     // For codex-app-server, skills live under plugins/cortextos-agent-skills/skills
     // and are copied in by the template; .claude/skills is Claude-Code-only.
     const isCodexAppServer = options.runtime === 'codex-app-server';
-    if (!isCodexAppServer) {
+    const isOpencode = options.runtime === 'opencode';
+    if (!isCodexAppServer && !isOpencode) {
       mkdirSync(join(agentDir, '.claude', 'skills'), { recursive: true });
     }
 
-    // Resolve template name. Codex agents created with the default --template agent
-    // get the codex-specific bootstrap in templates/agent-codex/. Any explicit
-    // --template choice is honored as-is so orchestrator/analyst/etc still work.
-    const effectiveTemplate = (isCodexAppServer && options.template === 'agent')
+    // Resolve template name. Runtime-specific default agents get runtime-native
+    // bootstraps; explicit template choices are honored so orchestrator/analyst
+    // etc still work behind their current compatibility gates.
+    const effectiveTemplate = isCodexAppServer && options.template === 'agent'
       ? 'agent-codex'
-      : options.template;
+      : isOpencode && options.template === 'agent'
+        ? 'agent-opencode'
+        : options.template;
 
     // Copy template files
     const templateDir = findTemplateDir(projectRoot, effectiveTemplate);
@@ -138,6 +141,20 @@ export const addAgentCommand = new Command('add-agent')
         }
       } catch (err) {
         console.error(`Warning: failed to install codex skill symlinks: ${(err as Error).message}`);
+      }
+    }
+
+    // OpenCode agents: expose the same local Cortext skill bundle through
+    // agent-local `.opencode/skills/<skill>` symlinks so OpenCode's native
+    // `skill` tool can discover them without relying on host-global state.
+    if (isOpencode) {
+      try {
+        const linksCreated = installOpencodeSkillSymlinks(agentDir);
+        if (linksCreated > 0) {
+          console.log(`  Linked ${linksCreated} skill(s) into .opencode/skills/`);
+        }
+      } catch (err) {
+        console.error(`Warning: failed to install opencode skill symlinks: ${(err as Error).message}`);
       }
     }
 
@@ -372,6 +389,39 @@ function installCodexSkillSymlinks(agentDir: string, agentName: string): number 
       linked++;
     } catch (err) {
       // Don't abort the whole scaffold for one bad symlink.
+      console.error(`    Warning: failed to symlink ${linkPath}: ${(err as Error).message}`);
+    }
+  }
+  return linked;
+}
+
+function installOpencodeSkillSymlinks(agentDir: string): number {
+  const skillsRoot = join(agentDir, 'plugins', 'cortextos-agent-skills', 'skills');
+  if (!existsSync(skillsRoot)) return 0;
+
+  const opencodeSkillsDir = join(agentDir, '.opencode', 'skills');
+  mkdirSync(opencodeSkillsDir, { recursive: true });
+
+  let linked = 0;
+  const entries = readdirSync(skillsRoot, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const skillSrc = join(skillsRoot, entry.name);
+    const linkPath = join(opencodeSkillsDir, entry.name);
+    try {
+      if (existsSync(linkPath) || lstatSync(linkPath, { throwIfNoEntry: false } as any)) {
+        try {
+          const st = lstatSync(linkPath);
+          if (st.isSymbolicLink()) {
+            unlinkSync(linkPath);
+          } else {
+            continue;
+          }
+        } catch { /* path likely doesn't exist; continue to symlink */ }
+      }
+      symlinkSync(skillSrc, linkPath, 'dir');
+      linked++;
+    } catch (err) {
       console.error(`    Warning: failed to symlink ${linkPath}: ${(err as Error).message}`);
     }
   }

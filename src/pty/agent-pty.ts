@@ -32,8 +32,8 @@ export class AgentPTY {
   private pty: IPty | null = null;
   private _alive = false;
   private outputBuffer: OutputBuffer;
-  private env: CtxEnv;
-  private config: AgentConfig;
+  protected env: CtxEnv;
+  protected config: AgentConfig;
   private onExitHandler: ((exitCode: number, signal?: number) => void) | null = null;
   private spawnFn: SpawnFn | null = null;
 
@@ -135,6 +135,8 @@ export class AgentPTY {
         }
       } catch { /* leave unset if context.json is missing or malformed */ }
     }
+
+    this.customizeEnv(ptyEnv);
 
     // Spawn the agent binary directly (no shell wrapper) — cross-platform, no shell escaping needed.
     // env is passed natively via node-pty options; no bash export commands required.
@@ -277,6 +279,15 @@ export class AgentPTY {
     args.push(prompt);
 
     return args;
+  }
+
+  /**
+   * Runtime-specific env hook. Subclasses such as OpencodePTY use this to add
+   * CLI-specific isolation variables while keeping AgentPTY's shared cortextOS
+   * env/secrets loading path in one place.
+   */
+  protected customizeEnv(_env: Record<string, string>): void {
+    // Default Claude Code runtime has no extra env.
   }
 
   /**
