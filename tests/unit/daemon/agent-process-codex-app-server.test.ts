@@ -141,7 +141,7 @@ describe('AgentProcess codex-app-server runtime', () => {
     expect(sendMessage).toHaveBeenCalledWith('12345', 'Agent codex-app-agent is back online');
   });
 
-  it('skips back-online Telegram on handoff restart (issue #392)', async () => {
+  it('sends planned-restart msg1 but skips generic back-online Telegram on handoff restart', async () => {
     // Simulate handoff doc marker present at .handoff-doc-path so
     // consumeHandoffBlock() returns a non-empty fragment, marking the spawn
     // as a handoff restart that should suppress the daemon-direct ping.
@@ -163,7 +163,10 @@ describe('AgentProcess codex-app-server runtime', () => {
 
     const prompt = mockCodexAppServerPty.spawn.mock.calls[0]?.[1] ?? '';
     expect(prompt).toContain('CONTEXT HANDOFF');
-    expect(sendMessage).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledWith('12345', '🔄 codex-app-agent restarted (planned): no reason given');
+    expect(sendMessage).not.toHaveBeenCalledWith('12345', 'Agent codex-app-agent is back online');
+    expect(sendMessage).not.toHaveBeenCalledWith('12345', 'Agent codex-app-agent is back online (context handoff)');
+    expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it('does not send daemon-direct back-online Telegram for claude-code runtime (issue #392)', async () => {
@@ -228,4 +231,3 @@ describe('AgentProcess codex-app-server runtime', () => {
     expect(mockCodexAppServerPty.spawn).toHaveBeenLastCalledWith('continue', expect.any(String));
   });
 });
-

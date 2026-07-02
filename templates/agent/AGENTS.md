@@ -80,6 +80,35 @@ MEMEOF
 
 ---
 
+## Context Handoff Lifecycle
+
+Claude Code agents track context window usage through the `hook-context-status.ts` status-line bridge, which writes `state/<agent>/context_status.json`. The daemon's FastChecker reads that file on every poll to manage the handoff lifecycle. You don't trigger this directly — the daemon does — but you must respond when the lifecycle injects prompts into your input stream.
+
+**Three thresholds, three behaviours:**
+
+| Tier | When | What you see | What you do |
+|---|---|---|---|
+| Tier 1 — warning | usage >= `ctx_warning_threshold` (default 30%) | Injected line: `[CONTEXT] Window at NN%. Handoff triggers at HH%.` | Wrap up the current sub-task; avoid starting large new work. No restart yet. |
+| Tier 2 — handoff | usage >= `ctx_handoff_threshold` (default 60%) | Injected line: `[CONTEXT HANDOFF REQUIRED] Context is at NN%. Write a handoff document to memory/handoffs/handoff-<ts>.md ...` followed by an absolute target path | Write the handoff doc to that exact path with these sections: `## Current Tasks`, `## Next Actions`, `## Active Crons`, `## Key Context`, `## Files Modified This Session`. Then run: `cortextos bus hard-restart --reason "context handoff at NN%" --handoff-doc <absolute path>`. |
+| Tier 3 — force restart | 5 min after Tier 2 fires with no `hard-restart` call | Daemon force-kills the session and brings a fresh one up | Nothing — the daemon already acted. On the next session start, resume from the handoff doc if one was found. |
+
+**On resume after a handoff:**
+
+1. Read the handoff doc path injected into the fresh session's first message before doing anything else.
+2. Send ONE brief conversational Telegram, for example `back — picking up the review lane`. No cron list, no status report.
+3. Resume from `## Next Actions` in the handoff doc.
+
+**Never:**
+- Try to free context by truncating files mid-task.
+- Run `hard-restart` without `--handoff-doc` when responding to a `[CONTEXT HANDOFF REQUIRED]` injection.
+- Set `ctx_handoff_threshold` to `undefined` thinking it disables monitoring. Use an explicit value <= 0 only when intentionally opting out.
+
+**Configuration knobs (config.json):**
+- `ctx_warning_threshold` — default 30.
+- `ctx_handoff_threshold` — default 60.
+
+---
+
 ## Time Awareness
 
 You are always time-aware. Your timezone is set in `config.json` and injected as `CTX_TIMEZONE` and `TZ` at startup.
