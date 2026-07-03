@@ -340,11 +340,11 @@ export function canonicalizePath(p: string): string {
 }
 
 export interface ActiveTaskWorktree {
-  path: string;
-  branch: string;
-  repo: string;
-  taskName: string;
-  startedAt: string;
+  readonly path: string;
+  readonly branch: string;
+  readonly repo: string;
+  readonly taskName: string;
+  readonly startedAt: string;
 }
 
 /**
@@ -382,10 +382,13 @@ export function isProtectedBranch(branch: string): boolean {
  * `.git` exists, not its shape — a git worktree or submodule checkout also
  * has a `.git` (as a file, not a directory) and passes this too, so it
  * doesn't by itself guarantee `resolvedRepo` is the primary/top-level
- * checkout. Safe here because callers additionally cross-check the
- * record's `path`/`branch` against live `git worktree list` output, so an
- * agent already needs Bash trust to construct a scenario that reaches this
- * function at all.
+ * checkout. That laxity is harmless at both call sites, for different
+ * reasons: at write time (`startTaskWorktree`) this only guards against an
+ * obviously-bogus `--repo` — a worktree/submodule checkout there is fine
+ * since `git worktree add` works correctly from inside one. At read time
+ * (`validateTaskWorktreeRecord`) the subsequent `git worktree list`
+ * cross-check against the record's `path`/`branch` closes the gap this
+ * laxity would otherwise leave.
  */
 export function isGitRepoRoot(resolvedRepo: string): boolean {
   return existsSync(join(resolvedRepo, '.git'));

@@ -259,6 +259,33 @@ describe('startTaskWorktree', () => {
     expect(() => startTaskWorktree(agentDir, repo, 'demo')).toThrow(/branch "task\/demo" already exists/);
   });
 
+  it('still detects a pre-existing branch under a non-English git locale, and does not delete it', () => {
+    // Regression test for a real bug: branch pre-existence used to be
+    // inferred by pattern-matching git's English stderr text AFTER calling
+    // `git worktree add`. Under a non-English locale, git's message differs
+    // (verified: `LC_ALL=fr_FR.UTF-8` produces "Une branche nommée '...'
+    // existe déjà", not "a branch named '...' already exists"), so the
+    // regex never matched, execution fell through to the "git must have
+    // created this, roll it back" path, and `git branch -D` force-deleted
+    // the real, pre-existing branch. The fix checks existence with
+    // `git rev-parse --verify` BEFORE calling `git worktree add` at all,
+    // so no stderr text — in any language — is ever load-bearing here.
+    execFileSync('git', ['branch', 'task/demo'], { cwd: repo });
+    const originalLcAll = process.env.LC_ALL;
+    const originalLanguage = process.env.LANGUAGE;
+    process.env.LC_ALL = 'fr_FR.UTF-8';
+    process.env.LANGUAGE = 'fr';
+    try {
+      expect(() => startTaskWorktree(agentDir, repo, 'demo')).toThrow(/branch "task\/demo" already exists/);
+    } finally {
+      if (originalLcAll === undefined) delete process.env.LC_ALL; else process.env.LC_ALL = originalLcAll;
+      if (originalLanguage === undefined) delete process.env.LANGUAGE; else process.env.LANGUAGE = originalLanguage;
+    }
+    // The branch must survive — this is the actual regression being guarded.
+    const branches = execFileSync('git', ['branch', '--list', 'task/demo'], { cwd: repo, encoding: 'utf-8' });
+    expect(branches).toContain('demo');
+  });
+
   it('rolls back the branch git creates as a side effect when git worktree add fails for an unrelated reason (destination collision)', () => {
     // Verified empirically: `git worktree add <path> -b <branch>` creates
     // the branch BEFORE validating the destination, so a destination
@@ -388,6 +415,53 @@ describe('finishTaskWorktree', () => {
     // Branch itself must survive a 'merge' finish — only the worktree checkout is removed.
     const branches = execFileSync('git', ['branch', '--list', branch], { cwd: repo, encoding: 'utf-8' });
     expect(branches).toContain(branch.replace('task/', ''));
+  });
+
+  it('falls back to "unavailable" for commits/diffStat, not a fabricated 0, when base-branch resolution fails', async () => {
+    startTaskWorktree(agentDir, repo, 'demo');
+    execFileSyncFailOn.add('symbolic-ref');
+    try {
+      const result = await finishTaskWorktree(agentDir, paths, 'orchestrator', 'leadio', 'merge');
+      expect(result.commits).toBeNull();
+      expect(result.diffStat).toBe('(diff summary unavailable)');
+      // The finish itself must still complete (worktree removed, approval
+      // requested) — a failure to compute an approval-summary stat must
+      // never block the actual git cleanup.
+      expect(result.worktreeRemoved).toBe(true);
+      expect(result.approvalId).toBeTruthy();
+    } finally {
+      execFileSyncFailOn.delete('symbolic-ref');
+    }
+  });
+
+  it('reports commits as null (not a fabricated 0) when git rev-list fails, but still computes diffStat', async () => {
+    const { path: worktreePath } = startTaskWorktree(agentDir, repo, 'demo');
+    writeFileSync(join(worktreePath, 'feature.txt'), 'new feature');
+    execFileSync('git', ['add', '.'], { cwd: worktreePath });
+    execFileSync('git', ['commit', '-q', '-m', 'add feature'], { cwd: worktreePath });
+    execFileSyncFailOn.add('rev-list');
+    try {
+      const result = await finishTaskWorktree(agentDir, paths, 'orchestrator', 'leadio', 'merge');
+      expect(result.commits).toBeNull();
+      expect(result.diffStat).not.toBe('(diff summary unavailable)');
+    } finally {
+      execFileSyncFailOn.delete('rev-list');
+    }
+  });
+
+  it('falls back to "(diff summary unavailable)" when git diff --stat fails, but still reports commit count', async () => {
+    const { path: worktreePath } = startTaskWorktree(agentDir, repo, 'demo');
+    writeFileSync(join(worktreePath, 'feature.txt'), 'new feature');
+    execFileSync('git', ['add', '.'], { cwd: worktreePath });
+    execFileSync('git', ['commit', '-q', '-m', 'add feature'], { cwd: worktreePath });
+    execFileSyncFailOn.add('diff');
+    try {
+      const result = await finishTaskWorktree(agentDir, paths, 'orchestrator', 'leadio', 'merge');
+      expect(result.commits).toBe(1);
+      expect(result.diffStat).toBe('(diff summary unavailable)');
+    } finally {
+      execFileSyncFailOn.delete('diff');
+    }
   });
 
   it('deletes the branch on abandon and does not request approval', async () => {

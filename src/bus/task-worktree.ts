@@ -82,6 +82,37 @@ export function startTaskWorktree(
     throw new Error(`Worktree path already exists: ${worktreeRoot}. Choose a different task name.`);
   }
 
+  // Checked BEFORE attempting `git worktree add`, not by pattern-matching
+  // its stderr afterward. An earlier version distinguished "branch already
+  // exists" from "destination already exists" by matching git's English
+  // error text — under a non-English locale (verified empirically with
+  // LANG=fr_FR.UTF-8) that regex never matches, so a genuinely pre-existing
+  // branch fell through to the "git must have created this, roll it back"
+  // path and got force-deleted. Checking existence up front removes the
+  // locale dependency entirely: if the branch is already here, nothing
+  // below ever needs to guess why `worktree add` failed.
+  const branchAlreadyExisted = (() => {
+    try {
+      execFileSync('git', ['rev-parse', '--verify', '--quiet', `refs/heads/${branchName}`], {
+        cwd: resolvedRepo, stdio: 'pipe', timeout: 10000,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+  if (branchAlreadyExisted) {
+    // The most common real cause: a previous task with this same name was
+    // finished via 'merge' (which intentionally leaves the branch behind —
+    // see finishTaskWorktree) or via an 'abandon' whose branch-delete step
+    // itself failed.
+    throw new Error(
+      `Failed to create worktree — branch "${branchName}" already exists (likely left over from a ` +
+      `previous task with the same name that was merged, or whose cleanup failed). Delete it manually ` +
+      `with \`git branch -D ${branchName}\` (in ${resolvedRepo}) or choose a different task name/branch.`,
+    );
+  }
+
   ensureDir(dirname(worktreeRoot));
   try {
     execFileSync('git', ['worktree', 'add', worktreeRoot, '-b', branchName], {
@@ -91,43 +122,42 @@ export function startTaskWorktree(
     });
   } catch (err: any) {
     const stderr = err.stderr?.toString?.() || err.message || String(err);
-    // Anchored to git's actual branch-specific phrasing, not a generic
-    // "already exists" substring — that generic form ALSO matches an
-    // unrelated failure (the destination directory already existing and
-    // being non-empty), which would misdiagnose the cause and hand the
-    // operator a useless "delete the branch" fix for a directory problem.
-    if (/a branch named ['"].*['"] already exists/.test(stderr)) {
-      // The most common real cause: a previous task with this same name was
-      // finished via 'merge' (which intentionally leaves the branch behind —
-      // see finishTaskWorktree) or via an 'abandon' whose branch-delete step
-      // itself failed. Either way, a raw "fatal: a branch named 'X' already
-      // exists" is unhelpful on its own — point at the actual fix. Since git
-      // refuses to create the branch in this specific case (it already
-      // existed before this call), there's nothing to roll back here.
-      throw new Error(
-        `Failed to create worktree — branch "${branchName}" already exists (likely left over from a ` +
-        `previous task with the same name that was merged, or whose cleanup failed). Delete it manually ` +
-        `with \`git branch -D ${branchName}\` (in ${resolvedRepo}) or choose a different task name/branch. ` +
-        `Original error: ${stderr}`,
-      );
-    }
-    // For every OTHER failure (e.g. the destination directory already
-    // exists and is non-empty), git has already created `branchName` as a
-    // side effect before it got to validating the destination — verified
-    // empirically, this isn't speculative. Roll that back before
-    // re-throwing, or this failure leaves an orphan branch that then makes
-    // every retry hit the "branch already exists" case above, for a
-    // problem that was never actually about the branch.
+    // We already confirmed above that `branchName` did not exist before
+    // this call, so any failure here (e.g. the destination directory
+    // already existing and being non-empty) that leaves the branch present
+    // is unambiguously an orphan git created as a side effect before
+    // validating the destination — verified empirically, this isn't
+    // speculative. No stderr text matching needed to know it's safe to
+    // delete: existence alone is proof, since it couldn't have existed
+    // beforehand.
+    let branchNowExists = false;
     try {
       execFileSync('git', ['rev-parse', '--verify', '--quiet', `refs/heads/${branchName}`], {
-        cwd: resolvedRepo, stdio: 'pipe',
+        cwd: resolvedRepo, stdio: 'pipe', timeout: 10000,
       });
-      // If the above didn't throw, the branch now exists — git created it,
-      // since we know from the check above it didn't already exist as the
-      // "cause" of this failure. Clean it up.
-      execFileSync('git', ['branch', '-D', branchName], { cwd: resolvedRepo, stdio: 'pipe' });
-    } catch { /* branch doesn't exist (nothing to roll back) or the rollback itself failed — either way, not fatal to reporting the original error */ }
-    throw new Error(`Failed to create worktree at ${worktreeRoot}: ${stderr}`);
+      branchNowExists = true;
+    } catch (e: any) {
+      // Exit 1 means the branch doesn't exist — expected and silent (git
+      // never got far enough to create it). Anything else is an unexpected
+      // failure of the check itself and is logged, matching this file's
+      // fail-loud philosophy elsewhere.
+      if (e.status !== 1) {
+        console.error(`startTaskWorktree: rollback check for ${branchName} failed unexpectedly: ${e.stderr?.toString?.() || e.message}`);
+      }
+    }
+    let rollbackErr: any = null;
+    if (branchNowExists) {
+      try {
+        execFileSync('git', ['branch', '-D', branchName], { cwd: resolvedRepo, stdio: 'pipe', timeout: 10000 });
+      } catch (e: any) {
+        rollbackErr = e;
+        console.error(`startTaskWorktree: failed to roll back orphaned branch ${branchName}: ${e.stderr?.toString?.() || e.message}`);
+      }
+    }
+    throw new Error(
+      `Failed to create worktree at ${worktreeRoot}: ${stderr}` +
+      (rollbackErr ? ` Additionally, orphaned branch "${branchName}" could not be cleaned up automatically — delete it manually with \`git branch -D ${branchName}\` (in ${resolvedRepo}).` : ''),
+    );
   }
 
   // The worktree/branch now exist on disk with no state file yet — if
@@ -153,12 +183,12 @@ export function startTaskWorktree(
     let removeErr: any = null;
     let branchErr: any = null;
     try {
-      execFileSync('git', ['worktree', 'remove', worktreeRoot, '--force'], { cwd: resolvedRepo, stdio: 'pipe' });
+      execFileSync('git', ['worktree', 'remove', worktreeRoot, '--force'], { cwd: resolvedRepo, stdio: 'pipe', timeout: 10000 });
     } catch (e: any) {
       removeErr = e;
     }
     try {
-      execFileSync('git', ['branch', '-D', branchName], { cwd: resolvedRepo, stdio: 'pipe' });
+      execFileSync('git', ['branch', '-D', branchName], { cwd: resolvedRepo, stdio: 'pipe', timeout: 10000 });
     } catch (e: any) {
       branchErr = e;
     }
@@ -268,18 +298,19 @@ export async function finishTaskWorktree(
   let diffStat = '(diff summary unavailable)';
   let commits: number | null = null;
   try {
-    // Whatever the primary checkout currently has checked out, NOT
-    // necessarily the repo's configured default branch — assumes nothing
-    // else has the primary checkout mid-switch to a different branch while
-    // finish() runs. Good enough for an approval-summary diff stat; not a
-    // guarantee.
+    // Whatever `state.repo`'s own checkout currently has checked out, NOT
+    // necessarily the repo's configured default branch (and if `state.repo`
+    // is itself a worktree/submodule rather than the primary checkout, this
+    // is THAT checkout's branch, not the primary one's) — assumes nothing
+    // else switches it to a different branch while finish() runs. Good
+    // enough for an approval-summary diff stat; not a guarantee.
     const baseBranch = execFileSync('git', ['symbolic-ref', '--short', 'HEAD'], {
-      cwd: state.repo, encoding: 'utf-8',
+      cwd: state.repo, encoding: 'utf-8', timeout: 10000,
     }).trim();
     try {
       const parsed = parseInt(
         execFileSync('git', ['rev-list', `${baseBranch}..${state.branch}`, '--count'], {
-          cwd: state.repo, encoding: 'utf-8',
+          cwd: state.repo, encoding: 'utf-8', timeout: 10000,
         }).trim(), 10);
       // Number.isNaN, not `|| 0` — a NaN here means git emitted something
       // unexpected, not "zero commits." Falling back to 0 would reintroduce
@@ -290,7 +321,7 @@ export async function finishTaskWorktree(
     }
     try {
       const stat = execFileSync('git', ['diff', `${baseBranch}...${state.branch}`, '--stat'], {
-        cwd: state.repo, encoding: 'utf-8',
+        cwd: state.repo, encoding: 'utf-8', timeout: 10000,
       });
       diffStat = stat.trim().split('\n').slice(-1)[0] || '(no changes)';
     } catch (err: any) {
@@ -306,7 +337,7 @@ export async function finishTaskWorktree(
 
   let worktreeRemoved = true;
   try {
-    execFileSync('git', ['worktree', 'remove', state.path, '--force'], { cwd: state.repo, stdio: 'pipe' });
+    execFileSync('git', ['worktree', 'remove', state.path, '--force'], { cwd: state.repo, stdio: 'pipe', timeout: 10000 });
   } catch (err: any) {
     worktreeRemoved = false;
     console.error(
@@ -317,7 +348,7 @@ export async function finishTaskWorktree(
   if (action === 'abandon') {
     let branchDeleted = true;
     try {
-      execFileSync('git', ['branch', '-D', state.branch], { cwd: state.repo, stdio: 'pipe' });
+      execFileSync('git', ['branch', '-D', state.branch], { cwd: state.repo, stdio: 'pipe', timeout: 10000 });
     } catch (err: any) {
       branchDeleted = false;
       console.error(
