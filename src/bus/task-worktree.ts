@@ -36,6 +36,21 @@ function statePath(agentDir: string): string {
 }
 
 /**
+ * Strip Telegram-Markdown-significant characters before interpolating a
+ * value into the human-facing approval message. Backtick-wrapping alone is
+ * NOT sufficient: an embedded backtick breaks out of the code span, and
+ * link syntax (`[text](url)`) is applied by a later regex pass that isn't
+ * aware of any code-span wrapping already applied — src/telegram/api.ts's
+ * markdownToHtml runs its Markdown->HTML substitutions as sequential
+ * string-wide passes, not tag-aware parsing, so a wrapped `[text](url)`
+ * still renders as a live link. Stripping the characters that carry any
+ * Markdown meaning here is more robust than trying to escape them.
+ */
+function sanitizeForApprovalText(value: string): string {
+  return value.replace(/[`[\]()*_]/g, '');
+}
+
+/**
  * Fixed, repo-derived root — only the final path segment (taskName) is
  * agent-supplied, and it must already have passed the letters/numbers/
  * hyphen/underscore check in startTaskWorktree before reaching here; this
@@ -164,10 +179,14 @@ export async function finishTaskWorktree(
       cwd: state.repo, encoding: 'utf-8',
     }).trim();
     try {
-      commits = parseInt(
+      const parsed = parseInt(
         execFileSync('git', ['rev-list', `${defaultBranch}..${state.branch}`, '--count'], {
           cwd: state.repo, encoding: 'utf-8',
-        }).trim(), 10) || 0;
+        }).trim(), 10);
+      // Number.isNaN, not `|| 0` — a NaN here means git emitted something
+      // unexpected, not "zero commits." Falling back to 0 would reintroduce
+      // the exact fabricated-count problem this function otherwise avoids.
+      commits = Number.isNaN(parsed) ? null : parsed;
     } catch (err: any) {
       console.error(`task-worktree finish: failed to count commits: ${err.message || err}`);
     }
@@ -214,13 +233,16 @@ export async function finishTaskWorktree(
     ? ''
     : ` WARNING: the worktree checkout at ${state.path} could not be removed automatically and may still exist on disk.`;
   const commitsText = commits === null ? 'commit count unavailable' : `${commits} commit(s)`;
-  // Backtick-wrapped so Telegram renders them as inline code rather than
-  // parsing any Markdown control characters they might contain — taskName
-  // is regex-validated on a legitimate `start`, but this data is read from
-  // a file an agent could in principle hand-write (see module doc above),
-  // so treat it as untrusted for display purposes too.
-  const approvalTitle = `Merge task "\`${state.taskName}\`" (\`${state.branch}\`)`;
-  const approvalContext = `${commitsText}, ${diffStat}. Branch: \`${state.branch}\` in ${state.repo}.${cleanupNote}`;
+  // Sanitized (not just backtick-wrapped, see sanitizeForApprovalText's doc
+  // comment for why wrapping alone doesn't work) before interpolation —
+  // taskName is charset-validated by validateTaskWorktreeRecord so this is
+  // defense-in-depth for it, but branch/repo have no such restriction and
+  // are read from a file an agent could in principle hand-write (see module
+  // doc above), so treat them as untrusted for display purposes too.
+  const safeTaskName = sanitizeForApprovalText(state.taskName);
+  const safeBranch = sanitizeForApprovalText(state.branch);
+  const approvalTitle = `Merge task "${safeTaskName}" (${safeBranch})`;
+  const approvalContext = `${commitsText}, ${diffStat}. Branch: ${safeBranch} in ${sanitizeForApprovalText(state.repo)}.${cleanupNote}`;
 
   try {
     const approvalId = await createApproval(

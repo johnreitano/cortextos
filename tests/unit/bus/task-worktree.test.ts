@@ -304,4 +304,30 @@ describe('finishTaskWorktree', () => {
       errorSpy.mockRestore();
     }
   });
+
+  it('strips Markdown-significant characters from branch/repo before they reach the approval message', async () => {
+    // Git itself allows backtick/parens/underscore in ref names (verified:
+    // `git check-ref-format --branch` accepts this string) — so a real,
+    // legitimately-registered branch can still carry characters that would
+    // otherwise let it break out of a Markdown code span or inject a link
+    // in the Telegram-rendered approval text.
+    const dangerousBranch = 'feature`evil`(x)_y';
+    startTaskWorktree(agentDir, repo, 'demo', dangerousBranch);
+
+    createApprovalSpy.mockClear(); // createApprovalSpy is module-level and shared across tests
+    await finishTaskWorktree(agentDir, paths, 'orchestrator', 'leadio', 'merge');
+
+    expect(createApprovalSpy).toHaveBeenCalledTimes(1);
+    const [, , , title, , context] = createApprovalSpy.mock.calls[0];
+    for (const text of [title, context]) {
+      // The message template itself legitimately uses parens/quotes for
+      // structure — check the DANGEROUS value doesn't survive intact and
+      // that backtick specifically (never used by the template itself)
+      // is gone, rather than banning every bracket/paren in the whole string.
+      expect(text).not.toContain(dangerousBranch);
+      expect(text).not.toMatch(/`/);
+    }
+    // Sanitization doesn't just delete the whole value — the safe parts survive.
+    expect(title).toContain('featureevilxy');
+  });
 });

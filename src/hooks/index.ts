@@ -359,6 +359,17 @@ export function validateTaskWorktreeRecord(record: any): ActiveTaskWorktree | nu
     console.error('task-worktree: rejecting record — missing or wrong-typed field(s)');
     return null;
   }
+  // Same charset `startTaskWorktree` enforces at write time — re-applied
+  // here because taskName is otherwise never cross-checked against
+  // anything (unlike path/branch/repo), and it's interpolated into a
+  // human-facing Telegram approval message. Restricting it to
+  // letters/numbers/hyphens/underscores rules out Markdown control
+  // characters (backticks, brackets, parens, asterisks) at the source,
+  // rather than trying to escape them at every display site.
+  if (!/^[a-zA-Z0-9_-]+$/.test(record.taskName)) {
+    console.error('task-worktree: rejecting record — taskName contains disallowed characters');
+    return null;
+  }
   // Independently of the path/branch cross-check below: never grant
   // task-worktree trust to a record naming main/master as its branch, even
   // if some future change loosens the other checks — editing/Bash-ing
@@ -376,6 +387,7 @@ export function validateTaskWorktreeRecord(record: any): ActiveTaskWorktree | nu
     return null;
   }
 
+  let foundPath = false;
   let actualBranch: string | null = null;
   try {
     const list = execFileSync('git', ['worktree', 'list', '--porcelain'], {
@@ -384,6 +396,7 @@ export function validateTaskWorktreeRecord(record: any): ActiveTaskWorktree | nu
     for (const block of list.split('\n\n')) {
       const pathMatch = block.match(/^worktree (.+)$/m);
       if (!pathMatch || canonicalizePath(resolve(pathMatch[1])) !== canonPath) continue;
+      foundPath = true;
       const branchMatch = block.match(/^branch refs\/heads\/(.+)$/m);
       actualBranch = branchMatch ? branchMatch[1] : null;
       break;
@@ -392,8 +405,17 @@ export function validateTaskWorktreeRecord(record: any): ActiveTaskWorktree | nu
     console.error(`task-worktree: rejecting record — failed to run git worktree list: ${err.message || err}`);
     return null;
   }
+  // "Not registered at all" and "registered but detached" are distinct
+  // failure classes with different causes (stale/fabricated record vs.
+  // something manually checking out a commit inside a live worktree) —
+  // logged separately so troubleshooting `finish` doesn't have to guess
+  // which one happened.
+  if (!foundPath) {
+    console.error(`task-worktree: rejecting record — path is not a currently registered git worktree of ${record.repo}`);
+    return null;
+  }
   if (actualBranch === null) {
-    console.error(`task-worktree: rejecting record — path is not a currently registered git worktree of ${record.repo} (or it's detached)`);
+    console.error(`task-worktree: rejecting record — path is a registered worktree of ${record.repo} but is detached (no branch checked out)`);
     return null;
   }
   if (actualBranch !== record.branch) {
@@ -403,7 +425,7 @@ export function validateTaskWorktreeRecord(record: any): ActiveTaskWorktree | nu
     return null;
   }
 
-  return { path: canonPath, branch: actualBranch, repo: record.repo, taskName: record.taskName };
+  return { path: canonPath, branch: actualBranch, repo: canonRepo, taskName: record.taskName };
 }
 
 /**
@@ -419,7 +441,8 @@ export function getActiveTaskWorktree(agentDir: string): ActiveTaskWorktree | nu
   let record: any;
   try {
     record = JSON.parse(readFileSync(statePath, 'utf-8'));
-  } catch {
+  } catch (err: any) {
+    console.error(`task-worktree: rejecting record — failed to read/parse ${statePath}: ${err.message || err}`);
     return null;
   }
   return validateTaskWorktreeRecord(record);

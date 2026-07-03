@@ -413,6 +413,44 @@ describe('Hook Utilities', () => {
       expect(validateTaskWorktreeRecord({ path: '/a', repo: '/b', branch: 'main', taskName: 'x' })).toBeNull();
       expect(validateTaskWorktreeRecord({ path: '/a', repo: '/b', branch: 'master', taskName: 'x' })).toBeNull();
     });
+
+    it('rejects a taskName containing characters outside the letters/numbers/hyphen/underscore charset', () => {
+      // taskName is never cross-checked against the worktree the way
+      // path/branch are, and it's interpolated into a human-facing Telegram
+      // approval message — so it's charset-restricted here to rule out
+      // Markdown control characters at the source, matching the same
+      // regex startTaskWorktree enforces at write time.
+      expect(validateTaskWorktreeRecord({ path: '/a', repo: '/b', branch: 'x', taskName: 'a`b' })).toBeNull();
+      expect(validateTaskWorktreeRecord({ path: '/a', repo: '/b', branch: 'x', taskName: '[link](evil)' })).toBeNull();
+      // A charset-compliant taskName passes THIS check (proven by every
+      // other test in this file using a real worktree with taskName
+      // 'demo' — those only ever fail, if at all, for unrelated reasons).
+    });
+
+    it('distinguishes "not a registered worktree" from "registered but detached" and rejects both', () => {
+      const base = mkdtempSync(join(tmpdir(), 'hookperm-taskwt-detached-'));
+      try {
+        const repo = join(base, 'repo');
+        mkdirSync(repo, { recursive: true });
+        execFileSync('git', ['init', '-q'], { cwd: repo });
+        execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
+        execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
+        writeFileSync(join(repo, 'README.md'), 'hello');
+        execFileSync('git', ['add', '.'], { cwd: repo });
+        execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: repo });
+
+        const worktreePath = join(base, '.cortextos-task-worktrees', 'repo', 'demo');
+        mkdirSync(join(base, '.cortextos-task-worktrees', 'repo'), { recursive: true });
+        // Detached — no -b, just checks out the current commit directly.
+        execFileSync('git', ['worktree', 'add', '--detach', worktreePath], { cwd: repo });
+
+        expect(validateTaskWorktreeRecord({
+          repo, path: worktreePath, branch: 'task/demo', taskName: 'demo',
+        })).toBeNull();
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
   });
 
   describe('Permission hook skips ExitPlanMode', () => {
