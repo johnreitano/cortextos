@@ -16,6 +16,7 @@ import {
   waitForResponseFile,
   formatToolSummary,
   isClaudeDirOperation,
+  isTaskWorktreeOperation,
   sanitizeCodeBlock,
   buildPermissionKeyboard,
   cleanupResponseFile,
@@ -39,8 +40,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Auto-approve .claude/ directory writes
-  if (isClaudeDirOperation(tool_name, tool_input)) {
+  // Auto-approve .claude/ directory writes, and tool calls confined to an
+  // active, verified task worktree (see `cortextos bus task-worktree`).
+  if (isClaudeDirOperation(tool_name, tool_input) || isTaskWorktreeOperation(tool_name, tool_input)) {
     outputDecision('allow');
     return;
   }

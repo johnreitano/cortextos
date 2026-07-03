@@ -7,6 +7,7 @@ import { readFileSync, existsSync, watch, statSync, unlinkSync, mkdirSync, realp
 import { join, resolve, sep, dirname, basename } from 'path';
 import { homedir } from 'os';
 import * as crypto from 'crypto';
+import { execFileSync } from 'child_process';
 
 /**
  * Read all data from stdin as a string.
@@ -307,6 +308,101 @@ function canonicalizePath(p: string): string {
       dir = parent;
     }
   }
+}
+
+interface ActiveTaskWorktree {
+  path: string;
+  branch: string;
+  repo: string;
+  taskName: string;
+}
+
+/**
+ * Read and validate the active task-worktree record for an agent, if any.
+ * Returns null if there is no active task, the record is malformed, or the
+ * recorded path fails verification against the repo's actual worktree list.
+ *
+ * This validation is defense-in-depth: `cortextos bus task-worktree start`
+ * (src/bus/task-worktree.ts) is the only code path that writes this file,
+ * always with a path under the fixed `.cortextos-task-worktrees/` convention.
+ * But since the file lives inside the already-trusted `.claude/` tree, an
+ * agent COULD write to it directly — so we re-derive the expected path from
+ * `record.repo` and cross-check it against `git worktree list` rather than
+ * trusting `record.path` on its own. A tampered or stale record fails safe
+ * (no trust), it never grants access to whatever it happens to name.
+ */
+function getActiveTaskWorktree(agentDir: string): ActiveTaskWorktree | null {
+  const statePath = join(agentDir, '.claude', 'state', 'active-task-worktree.json');
+  if (!existsSync(statePath)) return null;
+
+  let record: any;
+  try {
+    record = JSON.parse(readFileSync(statePath, 'utf-8'));
+  } catch {
+    return null;
+  }
+  if (!record || typeof record.path !== 'string' || typeof record.repo !== 'string' || typeof record.branch !== 'string') {
+    return null;
+  }
+  // Never trust the repo's own primary checkout as a "task worktree" — it
+  // must be a dedicated, disposable branch.
+  if (record.branch === 'main' || record.branch === 'master') return null;
+
+  const canonRepo = canonicalizePath(resolve(record.repo));
+  const expectedRoot = join(dirname(canonRepo), '.cortextos-task-worktrees', basename(canonRepo));
+  const canonPath = canonicalizePath(resolve(record.path));
+  if (canonPath !== expectedRoot && !canonPath.startsWith(expectedRoot + sep)) return null;
+
+  try {
+    const list = execFileSync('git', ['worktree', 'list', '--porcelain'], {
+      cwd: record.repo, encoding: 'utf-8', timeout: 10000,
+    });
+    const worktreePaths = list.split('\n\n').map(block => {
+      const m = block.match(/^worktree (.+)$/m);
+      return m ? canonicalizePath(resolve(m[1])) : null;
+    });
+    if (!worktreePaths.includes(canonPath)) return null;
+  } catch {
+    return null;
+  }
+
+  return { path: canonPath, branch: record.branch, repo: record.repo, taskName: record.taskName };
+}
+
+/**
+ * Whether a tool call is confined to the agent's currently active, verified
+ * task worktree (see `cortextos bus task-worktree start`/`finish`).
+ *
+ * Edit/Write are checked for path containment exactly like
+ * isClaudeDirOperation. Bash is NOT — Claude Code's Bash tool carries no
+ * per-call working directory, and this hook runs as a stateless subprocess
+ * per call, so there's no reliable signal to confine a shell command to the
+ * worktree. While a task is active, Bash is trusted unconditionally; this is
+ * a deliberate, wider trust grant accepted for the task's duration (see
+ * design discussion — a scoped/allowlisted Bash was considered and rejected
+ * as not enforceable). Calling `task-worktree finish` deletes the state file
+ * BEFORE computing anything else, closing this window immediately — so a
+ * subsequent merge/deploy step always goes through the normal Telegram gate.
+ */
+export function isTaskWorktreeOperation(
+  toolName: string,
+  toolInput: any,
+  agentDir?: string,
+): boolean {
+  const base = agentDir ?? process.env.CTX_AGENT_DIR;
+  if (!base) return false;
+  const active = getActiveTaskWorktree(resolve(base));
+  if (!active) return false;
+
+  if (toolName === 'Bash') return true;
+
+  if (toolName !== 'Edit' && toolName !== 'Write') return false;
+  const filePath = toolInput?.file_path;
+  if (typeof filePath !== 'string' || filePath.length === 0) return false;
+
+  const target = canonicalizePath(resolve(active.path, filePath));
+  if (target !== active.path && !target.startsWith(active.path + sep)) return false;
+  return !hasSymlinkComponent(active.path, target);
 }
 
 /**
