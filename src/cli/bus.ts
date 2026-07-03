@@ -1169,7 +1169,8 @@ busCommand
           const status = result.worktreeRemoved
             ? 'Task worktree closed.'
             : 'Task worktree trust revoked, but the on-disk worktree could not be removed automatically — remove it manually with `git worktree remove --force`.';
-          console.log(`${status} ${result.commits} commit(s), ${result.diffStat}.`);
+          const commitsText = result.commits === null ? 'commit count unavailable' : `${result.commits} commit(s)`;
+          console.log(`${status} ${commitsText}, ${result.diffStat}.`);
           if (result.branchDeleted === false) {
             console.log('WARNING: the task branch could not be deleted — remove it manually with `git branch -D`.');
           }

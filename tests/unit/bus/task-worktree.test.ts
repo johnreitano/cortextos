@@ -40,6 +40,22 @@ vi.mock('child_process', async (importOriginal) => {
   } };
 });
 
+// A controllable spy wrapping the real createApproval — defaults to calling
+// through, but individual tests can `.mockImplementationOnce` a throw to
+// verify finishTaskWorktree doesn't lose its cleanup-status context when
+// approval creation itself fails. vi.hoisted() is required here (unlike the
+// plain `const` used for the fs/child_process wrappers above) because the
+// factory below assigns a default implementation eagerly, at module-load
+// time — referencing a plain top-level `const` from inside a hoisted
+// vi.mock factory would throw a TDZ error since imports (which trigger the
+// factory) are hoisted above regular `const` declarations.
+const { createApprovalSpy } = vi.hoisted(() => ({ createApprovalSpy: vi.fn() }));
+vi.mock('../../../src/bus/approval', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../src/bus/approval')>();
+  createApprovalSpy.mockImplementation((...args: Parameters<typeof actual.createApproval>) => actual.createApproval(...args));
+  return { ...actual, createApproval: (...args: any[]) => createApprovalSpy(...args) };
+});
+
 import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -230,5 +246,62 @@ describe('finishTaskWorktree', () => {
     await expect(finishTaskWorktree(agentDir, paths, 'orchestrator', 'leadio', 'abandon'))
       .rejects.toThrow(/failed validation/);
     expect(existsSync(worktreePath)).toBe(true);
+  });
+
+  it('refuses a record whose branch does not match the branch actually checked out at that path', async () => {
+    const { path: worktreePath } = startTaskWorktree(agentDir, repo, 'demo');
+    // A second, real branch that exists in the repo but has nothing to do
+    // with this worktree — the exact scenario the branch/path cross-check
+    // exists to catch: path and repo are genuinely valid, only branch lies.
+    execFileSync('git', ['branch', 'someone-elses-branch'], { cwd: repo });
+    writeFileSync(statePath(), JSON.stringify({
+      repo, path: worktreePath, branch: 'someone-elses-branch', taskName: 'demo', startedAt: new Date().toISOString(),
+    }));
+
+    await expect(finishTaskWorktree(agentDir, paths, 'orchestrator', 'leadio', 'abandon'))
+      .rejects.toThrow(/failed validation/);
+
+    // Neither the real worktree branch nor the tampered-target branch was deleted.
+    const branches = execFileSync('git', ['branch', '--list'], { cwd: repo, encoding: 'utf-8' });
+    expect(branches).toContain('demo');
+    expect(branches).toContain('someone-elses-branch');
+  });
+
+  it('surfaces worktreeRemoved/branchDeleted as false, without throwing, when git commands fail', async () => {
+    const { path: worktreePath, branch } = startTaskWorktree(agentDir, repo, 'demo');
+    // A locked worktree makes both `git worktree remove` and (since it's
+    // still checked out) the follow-on `git branch -D` fail deterministically.
+    execFileSync('git', ['worktree', 'lock', worktreePath], { cwd: repo });
+
+    const result = await finishTaskWorktree(agentDir, paths, 'orchestrator', 'leadio', 'abandon');
+    expect(result.worktreeRemoved).toBe(false);
+    expect(result.branchDeleted).toBe(false);
+    // Nothing was silently cleaned up — both survive on disk for manual recovery.
+    expect(existsSync(worktreePath)).toBe(true);
+    const branches = execFileSync('git', ['branch', '--list', branch], { cwd: repo, encoding: 'utf-8' });
+    expect(branches).toContain('demo');
+
+    execFileSync('git', ['worktree', 'unlock', worktreePath], { cwd: repo });
+    execFileSync('git', ['worktree', 'remove', worktreePath, '--force'], { cwd: repo });
+  });
+
+  it('does not lose cleanup-status context when createApproval throws', async () => {
+    startTaskWorktree(agentDir, repo, 'demo');
+    createApprovalSpy.mockImplementationOnce(() => {
+      throw new Error('disk full');
+    });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(finishTaskWorktree(agentDir, paths, 'orchestrator', 'leadio', 'merge'))
+        .rejects.toThrow(/disk full/);
+      // The cleanup that already happened (trust revoked, worktree removed)
+      // must be logged even though the approval — and thus the return
+      // value — never materializes.
+      const logged = errorSpy.mock.calls.map(c => c.join(' ')).join('\n');
+      expect(logged).toMatch(/failed to create merge approval/);
+      expect(logged).toMatch(/worktreeRemoved=true/);
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 });

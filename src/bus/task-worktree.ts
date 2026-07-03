@@ -102,7 +102,7 @@ export async function finishTaskWorktree(
   org: string,
   action: 'merge' | 'abandon',
   frameworkRoot?: string,
-): Promise<{ approvalId?: string; diffStat: string; commits: number; worktreeRemoved: boolean; branchDeleted?: boolean }> {
+): Promise<{ approvalId?: string; diffStat: string; commits: number | null; worktreeRemoved: boolean; branchDeleted?: boolean }> {
   const sp = statePath(agentDir);
   if (!existsSync(sp)) {
     throw new Error('No active task worktree for this agent.');
@@ -136,15 +136,24 @@ export async function finishTaskWorktree(
   // this point), so refusing here costs nothing but a clear error.
   const validated = validateTaskWorktreeRecord(rawState);
   if (!validated) {
+    // validateTaskWorktreeRecord already logged the specific reason (which
+    // field, which mismatch, or the underlying git error) to stderr — the
+    // thrown message here stays generic on purpose (no security benefit to
+    // repeating specifics in an exception that might surface to Telegram),
+    // but the reason is not actually lost, just logged separately.
     throw new Error(
       'Task worktree record failed validation — refusing to run any git operations against it. ' +
-      'The state file has been removed; if a worktree or branch still exists on disk, it must be cleaned up manually.',
+      'The state file has been removed; if a worktree or branch still exists on disk, it must be cleaned up manually. ' +
+      'See stderr/logs for the specific validation failure.',
     );
   }
-  const state: TaskWorktreeState = { ...validated, startedAt: rawState.startedAt };
+  const state: TaskWorktreeState = {
+    ...validated,
+    startedAt: typeof rawState.startedAt === 'string' ? rawState.startedAt : new Date().toISOString(),
+  };
 
   let diffStat = '(diff summary unavailable)';
-  let commits = 0;
+  let commits: number | null = null;
   try {
     // Whatever the primary checkout currently has checked out, NOT
     // necessarily the repo's configured default branch — assumes nothing
@@ -204,15 +213,36 @@ export async function finishTaskWorktree(
   const cleanupNote = worktreeRemoved
     ? ''
     : ` WARNING: the worktree checkout at ${state.path} could not be removed automatically and may still exist on disk.`;
-  const approvalId = await createApproval(
-    paths,
-    agentName,
-    org,
-    `Merge task "${state.taskName}" (${state.branch})`,
-    'deployment',
-    `${commits} commit(s), ${diffStat}. Branch: ${state.branch} in ${state.repo}.${cleanupNote}`,
-    frameworkRoot,
-    agentDir,
-  );
-  return { approvalId, diffStat, commits, worktreeRemoved };
+  const commitsText = commits === null ? 'commit count unavailable' : `${commits} commit(s)`;
+  // Backtick-wrapped so Telegram renders them as inline code rather than
+  // parsing any Markdown control characters they might contain — taskName
+  // is regex-validated on a legitimate `start`, but this data is read from
+  // a file an agent could in principle hand-write (see module doc above),
+  // so treat it as untrusted for display purposes too.
+  const approvalTitle = `Merge task "\`${state.taskName}\`" (\`${state.branch}\`)`;
+  const approvalContext = `${commitsText}, ${diffStat}. Branch: \`${state.branch}\` in ${state.repo}.${cleanupNote}`;
+
+  try {
+    const approvalId = await createApproval(
+      paths,
+      agentName,
+      org,
+      approvalTitle,
+      'deployment',
+      approvalContext,
+      frameworkRoot,
+      agentDir,
+    );
+    return { approvalId, diffStat, commits, worktreeRemoved };
+  } catch (err: any) {
+    // Trust is already revoked and the worktree cleanup already ran by this
+    // point — losing THIS information on top of a failed approval would
+    // leave no record anywhere of what happened to the worktree/branch.
+    console.error(
+      `task-worktree finish: failed to create merge approval (worktreeRemoved=${worktreeRemoved}, ` +
+      `commits=${commits ?? 'unavailable'}, diffStat=${JSON.stringify(diffStat)}, branch=${state.branch}, ` +
+      `repo=${state.repo}): ${err.message || err}`,
+    );
+    throw err;
+  }
 }

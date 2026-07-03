@@ -319,8 +319,9 @@ export interface ActiveTaskWorktree {
 
 /**
  * Validate an already-parsed task-worktree record. Returns null if it's
- * malformed, names main/master as its branch, or its path fails verification
- * against the repo's actual `git worktree list` output.
+ * malformed, names main/master as its branch, its path fails verification
+ * against the repo's actual `git worktree list` output, or its branch
+ * doesn't match the branch actually checked out at that path.
  *
  * This is the ONE validator used on every read of
  * `.claude/state/active-task-worktree.json`, by both the permission hook
@@ -329,9 +330,23 @@ export interface ActiveTaskWorktree {
  * `cortextos bus task-worktree start` is the only code path INTENDED to
  * write this file, nothing stops an agent from writing it directly — it
  * lives inside the already-trusted `.claude/` tree. Validating a record
- * bought by one reader but not the other would leave the other reader
+ * in one reader but not the other would leave the unvalidated reader
  * trusting an agent-supplied path/branch/repo outright; sharing this
  * function is what closes that gap for both.
+ *
+ * The path and branch checks are deliberately independent AND
+ * cross-referenced: verifying `path` alone isn't enough, because a record
+ * could keep a real, previously-verified `path` but swap in an unrelated
+ * `branch` — e.g. to make `finishTaskWorktree`'s `git branch -D` on the
+ * abandon path force-delete an arbitrary branch that has nothing to do
+ * with the sanctioned worktree. Requiring `record.branch` to equal the
+ * branch `git worktree list` reports for that exact path closes that.
+ *
+ * Every rejection is logged (stderr — stdout is reserved for the hook's
+ * JSON decision protocol) so a legitimate operational failure (git
+ * timeout, lock file, corrupted repo) isn't indistinguishable from an
+ * actual tampered record when someone's troubleshooting `finish`. Trust
+ * is fail-closed either way; logging the reason costs nothing security-wise.
  */
 export function validateTaskWorktreeRecord(record: any): ActiveTaskWorktree | null {
   if (
@@ -341,33 +356,54 @@ export function validateTaskWorktreeRecord(record: any): ActiveTaskWorktree | nu
     typeof record.branch !== 'string' ||
     typeof record.taskName !== 'string'
   ) {
+    console.error('task-worktree: rejecting record — missing or wrong-typed field(s)');
     return null;
   }
-  // Independently of the path check below: never grant task-worktree trust
-  // to a record naming main/master as its branch, even if some future change
-  // loosens the path check — editing/Bash-ing against the repo's mainline
-  // branch must never ride on this trust grant.
-  if (record.branch === 'main' || record.branch === 'master') return null;
+  // Independently of the path/branch cross-check below: never grant
+  // task-worktree trust to a record naming main/master as its branch, even
+  // if some future change loosens the other checks — editing/Bash-ing
+  // against the repo's mainline branch must never ride on this trust grant.
+  if (record.branch === 'main' || record.branch === 'master') {
+    console.error(`task-worktree: rejecting record — branch is ${record.branch}`);
+    return null;
+  }
 
   const canonRepo = canonicalizePath(resolve(record.repo));
   const expectedRoot = join(dirname(canonRepo), '.cortextos-task-worktrees', basename(canonRepo));
   const canonPath = canonicalizePath(resolve(record.path));
-  if (canonPath !== expectedRoot && !canonPath.startsWith(expectedRoot + sep)) return null;
+  if (canonPath !== expectedRoot && !canonPath.startsWith(expectedRoot + sep)) {
+    console.error(`task-worktree: rejecting record — path is not under the expected root ${expectedRoot}`);
+    return null;
+  }
 
+  let actualBranch: string | null = null;
   try {
     const list = execFileSync('git', ['worktree', 'list', '--porcelain'], {
       cwd: record.repo, encoding: 'utf-8', timeout: 10000,
     });
-    const worktreePaths = list.split('\n\n').map(block => {
-      const m = block.match(/^worktree (.+)$/m);
-      return m ? canonicalizePath(resolve(m[1])) : null;
-    });
-    if (!worktreePaths.includes(canonPath)) return null;
-  } catch {
+    for (const block of list.split('\n\n')) {
+      const pathMatch = block.match(/^worktree (.+)$/m);
+      if (!pathMatch || canonicalizePath(resolve(pathMatch[1])) !== canonPath) continue;
+      const branchMatch = block.match(/^branch refs\/heads\/(.+)$/m);
+      actualBranch = branchMatch ? branchMatch[1] : null;
+      break;
+    }
+  } catch (err: any) {
+    console.error(`task-worktree: rejecting record — failed to run git worktree list: ${err.message || err}`);
+    return null;
+  }
+  if (actualBranch === null) {
+    console.error(`task-worktree: rejecting record — path is not a currently registered git worktree of ${record.repo} (or it's detached)`);
+    return null;
+  }
+  if (actualBranch !== record.branch) {
+    console.error(
+      `task-worktree: rejecting record — branch mismatch: record says "${record.branch}", the worktree is actually on "${actualBranch}"`,
+    );
     return null;
   }
 
-  return { path: canonPath, branch: record.branch, repo: record.repo, taskName: record.taskName };
+  return { path: canonPath, branch: actualBranch, repo: record.repo, taskName: record.taskName };
 }
 
 /**
