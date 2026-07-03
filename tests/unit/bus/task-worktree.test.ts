@@ -75,7 +75,7 @@ vi.mock('../../../src/bus/approval', async (importOriginal) => {
   return { ...actual, createApproval: (...args: any[]) => createApprovalSpy(...args) };
 });
 
-import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync } from 'fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync, symlinkSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
@@ -257,6 +257,42 @@ describe('startTaskWorktree', () => {
     // task name later is a realistic, not just theoretical, collision.
     execFileSync('git', ['branch', 'task/demo'], { cwd: repo });
     expect(() => startTaskWorktree(agentDir, repo, 'demo')).toThrow(/branch "task\/demo" already exists/);
+  });
+
+  it('rolls back the branch git creates as a side effect when git worktree add fails for an unrelated reason (destination collision)', () => {
+    // Verified empirically: `git worktree add <path> -b <branch>` creates
+    // the branch BEFORE validating the destination, so a destination
+    // collision still leaves the branch behind unless this code cleans it
+    // up. This must NOT be confused with the "branch already exists" case
+    // above — here the branch didn't exist before this call, git created
+    // it and then failed for a different reason, and the fix (deleting the
+    // branch) is actually appropriate here.
+    //
+    // A dangling symlink at the destination reproduces this while bypassing
+    // startTaskWorktree's own `existsSync(worktreeRoot)` pre-check: Node's
+    // existsSync follows symlinks and reports based on the target, so a
+    // dangling symlink reads as "doesn't exist" — but git still refuses to
+    // write into it ("fatal: '<path>' already exists") and, per empirical
+    // verification, still creates the branch first.
+    const worktreeParent = join(base, '.cortextos-task-worktrees', 'repo');
+    mkdirSync(worktreeParent, { recursive: true });
+    symlinkSync(join(base, 'nonexistent-target'), join(worktreeParent, 'demo'));
+
+    let thrown: Error | undefined;
+    try {
+      startTaskWorktree(agentDir, repo, 'demo');
+    } catch (err: any) {
+      thrown = err;
+    }
+    expect(thrown?.message).toMatch(/Failed to create worktree at/);
+    // Must NOT be misdiagnosed as the branch-already-exists case.
+    expect(thrown?.message).not.toMatch(/branch "task\/demo" already exists/);
+
+    // The branch git created as a side effect must be rolled back — not
+    // left as an orphan that would misdiagnose every future retry as
+    // "branch already exists" for what's actually a destination problem.
+    const branches = execFileSync('git', ['branch', '--list', 'task/demo'], { cwd: repo, encoding: 'utf-8' });
+    expect(branches.trim()).toBe('');
   });
 });
 

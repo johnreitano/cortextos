@@ -91,12 +91,19 @@ export function startTaskWorktree(
     });
   } catch (err: any) {
     const stderr = err.stderr?.toString?.() || err.message || String(err);
-    if (/already exists/.test(stderr)) {
+    // Anchored to git's actual branch-specific phrasing, not a generic
+    // "already exists" substring — that generic form ALSO matches an
+    // unrelated failure (the destination directory already existing and
+    // being non-empty), which would misdiagnose the cause and hand the
+    // operator a useless "delete the branch" fix for a directory problem.
+    if (/a branch named ['"].*['"] already exists/.test(stderr)) {
       // The most common real cause: a previous task with this same name was
       // finished via 'merge' (which intentionally leaves the branch behind —
       // see finishTaskWorktree) or via an 'abandon' whose branch-delete step
       // itself failed. Either way, a raw "fatal: a branch named 'X' already
-      // exists" is unhelpful on its own — point at the actual fix.
+      // exists" is unhelpful on its own — point at the actual fix. Since git
+      // refuses to create the branch in this specific case (it already
+      // existed before this call), there's nothing to roll back here.
       throw new Error(
         `Failed to create worktree — branch "${branchName}" already exists (likely left over from a ` +
         `previous task with the same name that was merged, or whose cleanup failed). Delete it manually ` +
@@ -104,6 +111,22 @@ export function startTaskWorktree(
         `Original error: ${stderr}`,
       );
     }
+    // For every OTHER failure (e.g. the destination directory already
+    // exists and is non-empty), git has already created `branchName` as a
+    // side effect before it got to validating the destination — verified
+    // empirically, this isn't speculative. Roll that back before
+    // re-throwing, or this failure leaves an orphan branch that then makes
+    // every retry hit the "branch already exists" case above, for a
+    // problem that was never actually about the branch.
+    try {
+      execFileSync('git', ['rev-parse', '--verify', '--quiet', `refs/heads/${branchName}`], {
+        cwd: resolvedRepo, stdio: 'pipe',
+      });
+      // If the above didn't throw, the branch now exists — git created it,
+      // since we know from the check above it didn't already exist as the
+      // "cause" of this failure. Clean it up.
+      execFileSync('git', ['branch', '-D', branchName], { cwd: resolvedRepo, stdio: 'pipe' });
+    } catch { /* branch doesn't exist (nothing to roll back) or the rollback itself failed — either way, not fatal to reporting the original error */ }
     throw new Error(`Failed to create worktree at ${worktreeRoot}: ${stderr}`);
   }
 
@@ -250,12 +273,12 @@ export async function finishTaskWorktree(
     // else has the primary checkout mid-switch to a different branch while
     // finish() runs. Good enough for an approval-summary diff stat; not a
     // guarantee.
-    const defaultBranch = execFileSync('git', ['symbolic-ref', '--short', 'HEAD'], {
+    const baseBranch = execFileSync('git', ['symbolic-ref', '--short', 'HEAD'], {
       cwd: state.repo, encoding: 'utf-8',
     }).trim();
     try {
       const parsed = parseInt(
-        execFileSync('git', ['rev-list', `${defaultBranch}..${state.branch}`, '--count'], {
+        execFileSync('git', ['rev-list', `${baseBranch}..${state.branch}`, '--count'], {
           cwd: state.repo, encoding: 'utf-8',
         }).trim(), 10);
       // Number.isNaN, not `|| 0` — a NaN here means git emitted something
@@ -266,7 +289,7 @@ export async function finishTaskWorktree(
       console.error(`task-worktree finish: failed to count commits: ${err.message || err}`);
     }
     try {
-      const stat = execFileSync('git', ['diff', `${defaultBranch}...${state.branch}`, '--stat'], {
+      const stat = execFileSync('git', ['diff', `${baseBranch}...${state.branch}`, '--stat'], {
         cwd: state.repo, encoding: 'utf-8',
       });
       diffStat = stat.trim().split('\n').slice(-1)[0] || '(no changes)';

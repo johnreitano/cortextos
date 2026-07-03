@@ -376,7 +376,17 @@ export function isProtectedBranch(branch: string): boolean {
   return branch === 'main' || branch === 'master';
 }
 
-/** Shared "is this actually a git repository root" check (not just some cwd `git worktree list` happens to accept). */
+/**
+ * Shared "is this actually a git repository" check (not just some cwd
+ * `git worktree list` happens to accept). Note: this only checks that
+ * `.git` exists, not its shape — a git worktree or submodule checkout also
+ * has a `.git` (as a file, not a directory) and passes this too, so it
+ * doesn't by itself guarantee `resolvedRepo` is the primary/top-level
+ * checkout. Safe here because callers additionally cross-check the
+ * record's `path`/`branch` against live `git worktree list` output, so an
+ * agent already needs Bash trust to construct a scenario that reaches this
+ * function at all.
+ */
 export function isGitRepoRoot(resolvedRepo: string): boolean {
   return existsSync(join(resolvedRepo, '.git'));
 }
@@ -552,10 +562,10 @@ export function getActiveTaskWorktree(agentDir: string): ActiveTaskWorktree | nu
  * a cwd check (no signal to check) nor a command allowlist (defeatable by
  * shell metacharacters) can actually enforce containment, so while a task is
  * active, Bash is trusted unconditionally — a deliberate, wider trust grant
- * accepted for the task's duration. Calling `task-worktree finish` deletes
- * the state file BEFORE computing anything else, closing this window
- * immediately — so a subsequent merge/deploy step always goes through the
- * normal Telegram gate.
+ * accepted for the task's duration. Calling `task-worktree finish` reads
+ * the record it needs, then deletes the state file before validating the
+ * record, computing diffs, or touching the worktree — so a subsequent
+ * merge/deploy step always goes through the normal Telegram gate.
  */
 export function isTaskWorktreeOperation(
   toolName: string,
