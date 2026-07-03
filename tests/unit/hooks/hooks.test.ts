@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, symlinkSync } from 'fs';
-import { join, resolve } from 'path';
+import { join, resolve, sep } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
 import {
@@ -11,6 +11,9 @@ import {
   isTaskWorktreeOperation,
   validateTaskWorktreeRecord,
   canonicalizePath,
+  isValidTaskName,
+  isProtectedBranch,
+  isGitRepoRoot,
   sanitizeCodeBlock,
   buildPermissionKeyboard,
   buildPlanKeyboard,
@@ -454,6 +457,94 @@ describe('Hook Utilities', () => {
           JSON.stringify({ repo: worktreePath, path: repo, branch: 'task/demo', taskName: 'demo', startedAt: new Date().toISOString() }),
         );
         expect(isTaskWorktreeOperation('Bash', { command: 'ls' }, agentDir)).toBe(false);
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('isValidTaskName / isProtectedBranch / isGitRepoRoot (shared trust-boundary primitives)', () => {
+    it('isValidTaskName accepts only letters/numbers/hyphens/underscores', () => {
+      expect(isValidTaskName('demo')).toBe(true);
+      expect(isValidTaskName('demo-task_1')).toBe(true);
+      expect(isValidTaskName('')).toBe(false);
+      expect(isValidTaskName('has spaces')).toBe(false);
+      expect(isValidTaskName('has.dots')).toBe(false);
+      expect(isValidTaskName('has/slash')).toBe(false);
+      expect(isValidTaskName('has`backtick')).toBe(false);
+    });
+
+    it('isProtectedBranch matches main/master exactly — not case-insensitively, not as a substring', () => {
+      expect(isProtectedBranch('main')).toBe(true);
+      expect(isProtectedBranch('master')).toBe(true);
+      // Exact match only — a future ".includes()" simplification would
+      // wrongly start rejecting these legitimate branch names.
+      expect(isProtectedBranch('maintenance')).toBe(false);
+      expect(isProtectedBranch('remaining')).toBe(false);
+      expect(isProtectedBranch('task/demo')).toBe(false);
+      // Also exact-case only — this is a deliberate scope limit, not a
+      // bypass: an actual branch named "Main" is a different git ref than
+      // "main", so blocking it wouldn't protect anything real.
+      expect(isProtectedBranch('Main')).toBe(false);
+      expect(isProtectedBranch('MASTER')).toBe(false);
+    });
+
+    it('isGitRepoRoot requires a .git entry to exist, but does not itself distinguish a real repo root from a worktree/submodule checkout', () => {
+      const base = mkdtempSync(join(tmpdir(), 'hookperm-gitroot-'));
+      try {
+        const notRepo = join(base, 'not-a-repo');
+        mkdirSync(notRepo, { recursive: true });
+        expect(isGitRepoRoot(notRepo)).toBe(false);
+
+        const repo = join(base, 'repo');
+        mkdirSync(repo, { recursive: true });
+        execFileSync('git', ['init', '-q'], { cwd: repo });
+        expect(isGitRepoRoot(repo)).toBe(true);
+
+        // Documented scope limit, not a bug: a worktree's .git is a FILE
+        // (not a directory) pointing at the common gitdir, but
+        // isGitRepoRoot only checks existence, not shape — so it returns
+        // true for a worktree checkout too. This is acceptable here
+        // because reaching this code path at all already requires Bash
+        // trust (the agent could do anything via Bash already); this test
+        // exists to pin down and document the actual behavior rather than
+        // leave it an untested assumption.
+        execFileSync('git', ['commit', '-q', '--allow-empty', '-m', 'init'], { cwd: repo });
+        const worktreePath = join(base, 'a-worktree');
+        execFileSync('git', ['worktree', 'add', '--detach', worktreePath], { cwd: repo });
+        expect(isGitRepoRoot(worktreePath)).toBe(true);
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('canonicalizePath', () => {
+    it('treats a non-ENOENT lstat failure as unresolvable rather than silently climbing past it', () => {
+      // A plain file where a directory is expected makes realpathSync on a
+      // path "through" it fail with ENOTDIR, not ENOENT — canonicalizePath
+      // must not treat this the same as "this component doesn't exist yet"
+      // (genuinely benign); it backs security-relevant equality/prefix
+      // checks elsewhere, so returning a plausible-but-wrong resolved path
+      // here would be worse than falling back to the raw lexical input.
+      const base = mkdtempSync(join(tmpdir(), 'hookperm-canon-'));
+      try {
+        writeFileSync(join(base, 'not-a-dir'), 'plain file');
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const result = canonicalizePath(join(base, 'not-a-dir', 'nested', 'x.txt'));
+        errorSpy.mockRestore();
+        // Falls back to the raw lexical path rather than a partially-resolved one.
+        expect(result).toBe(join(base, 'not-a-dir', 'nested', 'x.txt'));
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+
+    it('still resolves a genuinely non-existent tail (ENOENT) against its existing ancestor as before', () => {
+      const base = mkdtempSync(join(tmpdir(), 'hookperm-canon-'));
+      try {
+        const result = canonicalizePath(join(base, 'does-not-exist-yet.txt'));
+        expect(result).toBe(canonicalizePath(base) + sep + 'does-not-exist-yet.txt');
       } finally {
         rmSync(base, { recursive: true, force: true });
       }

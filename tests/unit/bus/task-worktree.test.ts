@@ -221,6 +221,43 @@ describe('startTaskWorktree', () => {
     const branches = execFileSync('git', ['branch', '--list', 'task/demo'], { cwd: repo, encoding: 'utf-8' });
     expect(branches).toContain('demo');
   });
+
+  it('reports only the branch as still-present when worktree removal succeeds but branch deletion fails during rollback', () => {
+    mkdirSync(join(agentDir, '.claude'), { recursive: true });
+    writeFileSync(join(agentDir, '.claude', 'state'), 'not a directory');
+    execFileSyncFailOn.add('-D'); // only branch deletion fails; worktree remove succeeds
+
+    let thrown: Error | undefined;
+    try {
+      startTaskWorktree(agentDir, repo, 'demo');
+    } catch (err: any) {
+      thrown = err;
+    }
+    expect(thrown?.message).toMatch(/worktree removed/);
+    expect(thrown?.message).toMatch(/branch .* still exists/);
+
+    const worktreeRoot = join(base, '.cortextos-task-worktrees', 'repo', 'demo');
+    expect(existsSync(worktreeRoot)).toBe(false); // actually removed — message must not claim otherwise
+    const branches = execFileSync('git', ['branch', '--list', 'task/demo'], { cwd: repo, encoding: 'utf-8' });
+    expect(branches).toContain('demo'); // actually still present
+  });
+
+  // Note: there's no symmetric "worktree removal fails but branch deletion
+  // succeeds" test — git itself refuses to delete a branch that's still
+  // checked out in an existing worktree ("cannot delete branch ... used by
+  // worktree at ..."), so if `git worktree remove` genuinely fails, the
+  // subsequent `git branch -D` fails too as a real consequence, not an
+  // independent outcome. That's exactly the "both fail" case already
+  // covered above — this isn't a gap, it's git's own dependency between
+  // the two operations.
+
+  it('gives an actionable error, not a raw git failure, when the branch already exists (e.g. left over from a prior merge)', () => {
+    // finishTaskWorktree's 'merge' path intentionally leaves the branch
+    // behind (only the worktree checkout is removed) — so reusing the same
+    // task name later is a realistic, not just theoretical, collision.
+    execFileSync('git', ['branch', 'task/demo'], { cwd: repo });
+    expect(() => startTaskWorktree(agentDir, repo, 'demo')).toThrow(/branch "task\/demo" already exists/);
+  });
 });
 
 describe('finishTaskWorktree', () => {

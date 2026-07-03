@@ -83,10 +83,29 @@ export function startTaskWorktree(
   }
 
   ensureDir(dirname(worktreeRoot));
-  execFileSync('git', ['worktree', 'add', worktreeRoot, '-b', branchName], {
-    cwd: resolvedRepo,
-    stdio: 'pipe',
-  });
+  try {
+    execFileSync('git', ['worktree', 'add', worktreeRoot, '-b', branchName], {
+      cwd: resolvedRepo,
+      stdio: 'pipe',
+      timeout: 10000,
+    });
+  } catch (err: any) {
+    const stderr = err.stderr?.toString?.() || err.message || String(err);
+    if (/already exists/.test(stderr)) {
+      // The most common real cause: a previous task with this same name was
+      // finished via 'merge' (which intentionally leaves the branch behind —
+      // see finishTaskWorktree) or via an 'abandon' whose branch-delete step
+      // itself failed. Either way, a raw "fatal: a branch named 'X' already
+      // exists" is unhelpful on its own — point at the actual fix.
+      throw new Error(
+        `Failed to create worktree — branch "${branchName}" already exists (likely left over from a ` +
+        `previous task with the same name that was merged, or whose cleanup failed). Delete it manually ` +
+        `with \`git branch -D ${branchName}\` (in ${resolvedRepo}) or choose a different task name/branch. ` +
+        `Original error: ${stderr}`,
+      );
+    }
+    throw new Error(`Failed to create worktree at ${worktreeRoot}: ${stderr}`);
+  }
 
   // The worktree/branch now exist on disk with no state file yet — if
   // anything below fails, roll the worktree back rather than leaving an
@@ -288,9 +307,12 @@ export async function finishTaskWorktree(
   // Sanitized (not just backtick-wrapped, see sanitizeForApprovalText's doc
   // comment for why wrapping alone doesn't work) before interpolation —
   // taskName is charset-validated by validateTaskWorktreeRecord so this is
-  // defense-in-depth for it, but branch/repo/path have no such restriction
-  // and are read from a file an agent could in principle hand-write (see
-  // module doc above), so treat them all as untrusted for display purposes too.
+  // defense-in-depth for it, but branch/repo/path/diffStat have no such
+  // restriction: diffStat in particular is git's own `diff --stat` summary
+  // line, and while that line is git-generated rather than a raw filename
+  // today, relying on that as a guarantee rather than just sanitizing it
+  // like everything else in this message would be exactly the kind of
+  // unstated format assumption this function otherwise avoids.
   const cleanupNote = worktreeRemoved
     ? ''
     : ` WARNING: the worktree checkout at ${sanitizeForApprovalText(state.path)} could not be removed automatically and may still exist on disk.`;
@@ -298,7 +320,7 @@ export async function finishTaskWorktree(
   const safeTaskName = sanitizeForApprovalText(state.taskName);
   const safeBranch = sanitizeForApprovalText(state.branch);
   const approvalTitle = `Merge task "${safeTaskName}" (${safeBranch})`;
-  const approvalContext = `${commitsText}, ${diffStat}. Branch: ${safeBranch} in ${sanitizeForApprovalText(state.repo)}.${cleanupNote}`;
+  const approvalContext = `${commitsText}, ${sanitizeForApprovalText(diffStat)}. Branch: ${safeBranch} in ${sanitizeForApprovalText(state.repo)}.${cleanupNote}`;
 
   try {
     const approvalId = await createApproval(

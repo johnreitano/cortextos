@@ -303,6 +303,21 @@ function hasSymlinkComponent(rootDir: string, target: string): boolean {
  * exist yet (e.g. a Write that creates a new file), we realpath the deepest
  * existing ancestor — which resolves any symlinked component — then re-append
  * the non-existent tail. Falls back to the lexical path if nothing exists.
+ *
+ * ENOENT (component doesn't exist yet) is the only error treated as "keep
+ * climbing toward an ancestor that does exist" — that's the genuinely benign
+ * case this function is designed around. Any other realpathSync failure
+ * (EACCES, ELOOP — an actual symlink loop, ENOTDIR) is NOT safe to treat the
+ * same way: continuing to climb past one could produce a "resolved" path
+ * that doesn't actually reflect where a loop redirects, or paper over a
+ * permissions problem. This function backs the containment checks in
+ * isClaudeDirOperation/isTaskWorktreeOperation and the repo/path validation
+ * in validateTaskWorktreeRecord, so a wrong answer here doesn't just affect
+ * display — it can make an equality/prefix check pass or fail incorrectly.
+ * On any non-ENOENT error, log it and fall back to the raw lexical path
+ * immediately (not the deepest-resolved-ancestor logic) — callers' own
+ * checks then compare against an unresolved value, which fails closed
+ * (denies trust) rather than risk approving based on a wrong resolution.
  */
 export function canonicalizePath(p: string): string {
   let dir = p;
@@ -311,7 +326,11 @@ export function canonicalizePath(p: string): string {
     try {
       const real = realpathSync(dir);
       return tail.length ? resolve(real, ...tail.reverse()) : real;
-    } catch {
+    } catch (err: any) {
+      if (err.code !== 'ENOENT') {
+        console.error(`canonicalizePath: unexpected error resolving ${dir}: ${err.message || err}`);
+        return p;
+      }
       const parent = dirname(dir);
       if (parent === dir) return p; // reached fs root, nothing on the path exists
       tail.push(basename(dir));
