@@ -91,16 +91,35 @@ export function startTaskWorktree(
   // path and got force-deleted. Checking existence up front removes the
   // locale dependency entirely: if the branch is already here, nothing
   // below ever needs to guess why `worktree add` failed.
-  const branchAlreadyExisted = (() => {
-    try {
-      execFileSync('git', ['rev-parse', '--verify', '--quiet', `refs/heads/${branchName}`], {
-        cwd: resolvedRepo, stdio: 'pipe', timeout: 10000,
-      });
-      return true;
-    } catch {
-      return false;
+  //
+  // Fail CLOSED on an ambiguous result. `git rev-parse --verify --quiet`
+  // exits 1 (and ONLY 1) to mean "this ref genuinely does not exist" — that
+  // is the sole result we may safely read as "absent." Any other failure
+  // (exit 128 on a corrupt/unreadable ref, ENOENT if git is missing, or a
+  // thrown timeout/spawn error with no numeric status) means the check
+  // could not determine existence. Treating those as "absent" would be the
+  // same over-broad-signal bug this whole block exists to kill, one layer
+  // up: a false "absent" skips the guard below, `git worktree add` then
+  // fails because the branch really does exist, and the rollback path force-
+  // deletes it. So on anything other than exit 1 we refuse to proceed rather
+  // than march toward a destructive delete on a branch we couldn't see.
+  let branchAlreadyExisted: boolean;
+  try {
+    execFileSync('git', ['rev-parse', '--verify', '--quiet', `refs/heads/${branchName}`], {
+      cwd: resolvedRepo, stdio: 'pipe', timeout: 10000,
+    });
+    branchAlreadyExisted = true;
+  } catch (err: any) {
+    if (err.status === 1) {
+      branchAlreadyExisted = false;
+    } else {
+      throw new Error(
+        `Could not determine whether branch "${branchName}" already exists in ${resolvedRepo} ` +
+        `(git rev-parse failed: ${err.stderr?.toString?.() || err.message || err}). Refusing to create the ` +
+        `worktree, because proceeding now could later force-delete a branch this check failed to see.`,
+      );
     }
-  })();
+  }
   if (branchAlreadyExisted) {
     // The most common real cause: a previous task with this same name was
     // finished via 'merge' (which intentionally leaves the branch behind —
@@ -328,10 +347,12 @@ export async function finishTaskWorktree(
       console.error(`task-worktree finish: failed to compute diff stat: ${err.message || err}`);
     }
   } catch (err: any) {
-    // Couldn't even resolve the base branch (e.g. detached HEAD on the
-    // primary checkout) — commits/diffStat stay at their "unavailable"
-    // defaults rather than the misleading "0 commits, no diff" they'd
-    // otherwise silently present to the merge approver.
+    // Couldn't even resolve the base branch (e.g. detached HEAD on
+    // state.repo's own checkout — which, per the comment above, may itself
+    // be a worktree/submodule rather than the primary checkout) —
+    // commits/diffStat stay at their "unavailable" defaults rather than the
+    // misleading "0 commits, no diff" they'd otherwise silently present to
+    // the merge approver.
     console.error(`task-worktree finish: failed to resolve base branch: ${err.message || err}`);
   }
 

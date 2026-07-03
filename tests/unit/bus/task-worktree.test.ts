@@ -286,6 +286,30 @@ describe('startTaskWorktree', () => {
     expect(branches).toContain('demo');
   });
 
+  it('fails closed (does not delete the branch) when the pre-flight existence check fails for a non-exit-1 reason', () => {
+    // Regression test for the follow-on to the locale bug: the up-front
+    // `git rev-parse --verify` existence probe must treat ONLY exit 1 as
+    // "branch absent." If it collapsed every failure (a corrupt-ref exit
+    // 128, a spawn/ENOENT, or a timeout — none of which carry status 1)
+    // into "absent", it would skip the guard, let `git worktree add` fail
+    // because the branch really exists, and the rollback would then
+    // force-delete that pre-existing branch. execFileSyncFailOn throws a
+    // plain Error with no numeric `status`, faithfully simulating exactly
+    // that non-exit-1 failure class.
+    execFileSync('git', ['branch', 'task/demo'], { cwd: repo });
+    execFileSyncFailOn.add('rev-parse');
+    try {
+      // Must refuse rather than proceed — the error names the ambiguity, not
+      // a bogus "branch already exists" or a swallowed success.
+      expect(() => startTaskWorktree(agentDir, repo, 'demo')).toThrow(/Could not determine whether branch/);
+    } finally {
+      execFileSyncFailOn.delete('rev-parse');
+    }
+    // The pre-existing branch must survive untouched — the whole point.
+    const branches = execFileSync('git', ['branch', '--list', 'task/demo'], { cwd: repo, encoding: 'utf-8' });
+    expect(branches).toContain('demo');
+  });
+
   it('rolls back the branch git creates as a side effect when git worktree add fails for an unrelated reason (destination collision)', () => {
     // Verified empirically: `git worktree add <path> -b <branch>` creates
     // the branch BEFORE validating the destination, so a destination
