@@ -75,7 +75,7 @@ Log each round as an event (`cortextos bus log-event`) so the round count and fi
 ```bash
 cortextos bus task-worktree finish
 ```
-This deletes the state file (closing the trust window immediately, before anything else runs), removes the worktree, computes the diff stat and commit count, and automatically files a `create-approval` request (category `deployment`) summarizing the change. Follow the rest of the `approvals` skill's workflow from here — block your task on the approval ID, notify the user, wait for the inbox decision.
+This deletes the state file (closing the trust window immediately, before anything else runs), re-validates the record, computes the diff stat and commit count, attempts to remove the worktree (a failure here is reported but does not block the approval request — you may need to clean it up manually), and automatically files a `create-approval` request (category `deployment`) summarizing the change. Follow the rest of the `approvals` skill's workflow from here — block your task on the approval ID, notify the user, wait for the inbox decision.
 
 **Maxed out at 5 rounds with findings still open:**
 Still run `cortextos bus task-worktree finish` (never leave a task active indefinitely), but make the approval context explicit about the residual risk — include the outstanding critical/important findings in the task's context/notes so the human is deciding with full information, not blindly approving. Consider recommending against merging as-is if the findings are serious.

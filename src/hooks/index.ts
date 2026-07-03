@@ -294,7 +294,7 @@ function hasSymlinkComponent(rootDir: string, target: string): boolean {
  * existing ancestor — which resolves any symlinked component — then re-append
  * the non-existent tail. Falls back to the lexical path if nothing exists.
  */
-function canonicalizePath(p: string): string {
+export function canonicalizePath(p: string): string {
   let dir = p;
   const tail: string[] = [];
   for (;;) {
@@ -310,7 +310,7 @@ function canonicalizePath(p: string): string {
   }
 }
 
-interface ActiveTaskWorktree {
+export interface ActiveTaskWorktree {
   path: string;
   branch: string;
   repo: string;
@@ -318,34 +318,35 @@ interface ActiveTaskWorktree {
 }
 
 /**
- * Read and validate the active task-worktree record for an agent, if any.
- * Returns null if there is no active task, the record is malformed, or the
- * recorded path fails verification against the repo's actual worktree list.
+ * Validate an already-parsed task-worktree record. Returns null if it's
+ * malformed, names main/master as its branch, or its path fails verification
+ * against the repo's actual `git worktree list` output.
  *
- * This validation is defense-in-depth: `cortextos bus task-worktree start`
- * (src/bus/task-worktree.ts) is the only code path that writes this file,
- * always with a path under the fixed `.cortextos-task-worktrees/` convention.
- * But since the file lives inside the already-trusted `.claude/` tree, an
- * agent COULD write to it directly — so we re-derive the expected path from
- * `record.repo` and cross-check it against `git worktree list` rather than
- * trusting `record.path` on its own. A tampered or stale record fails safe
- * (no trust), it never grants access to whatever it happens to name.
+ * This is the ONE validator used on every read of
+ * `.claude/state/active-task-worktree.json`, by both the permission hook
+ * (`getActiveTaskWorktree` below) and `finishTaskWorktree`
+ * (src/bus/task-worktree.ts). It exists because, although
+ * `cortextos bus task-worktree start` is the only code path INTENDED to
+ * write this file, nothing stops an agent from writing it directly — it
+ * lives inside the already-trusted `.claude/` tree. Validating a record
+ * bought by one reader but not the other would leave the other reader
+ * trusting an agent-supplied path/branch/repo outright; sharing this
+ * function is what closes that gap for both.
  */
-function getActiveTaskWorktree(agentDir: string): ActiveTaskWorktree | null {
-  const statePath = join(agentDir, '.claude', 'state', 'active-task-worktree.json');
-  if (!existsSync(statePath)) return null;
-
-  let record: any;
-  try {
-    record = JSON.parse(readFileSync(statePath, 'utf-8'));
-  } catch {
+export function validateTaskWorktreeRecord(record: any): ActiveTaskWorktree | null {
+  if (
+    !record ||
+    typeof record.path !== 'string' ||
+    typeof record.repo !== 'string' ||
+    typeof record.branch !== 'string' ||
+    typeof record.taskName !== 'string'
+  ) {
     return null;
   }
-  if (!record || typeof record.path !== 'string' || typeof record.repo !== 'string' || typeof record.branch !== 'string') {
-    return null;
-  }
-  // Never trust the repo's own primary checkout as a "task worktree" — it
-  // must be a dedicated, disposable branch.
+  // Independently of the path check below: never grant task-worktree trust
+  // to a record naming main/master as its branch, even if some future change
+  // loosens the path check — editing/Bash-ing against the repo's mainline
+  // branch must never ride on this trust grant.
   if (record.branch === 'main' || record.branch === 'master') return null;
 
   const canonRepo = canonicalizePath(resolve(record.repo));
@@ -370,6 +371,25 @@ function getActiveTaskWorktree(agentDir: string): ActiveTaskWorktree | null {
 }
 
 /**
+ * Read and validate the active task-worktree record for an agent, if any.
+ * Returns null if there is no active task, the record is malformed, its
+ * branch is main/master, or the recorded path fails verification against
+ * the repo's actual worktree list — see `validateTaskWorktreeRecord`.
+ */
+export function getActiveTaskWorktree(agentDir: string): ActiveTaskWorktree | null {
+  const statePath = join(agentDir, '.claude', 'state', 'active-task-worktree.json');
+  if (!existsSync(statePath)) return null;
+
+  let record: any;
+  try {
+    record = JSON.parse(readFileSync(statePath, 'utf-8'));
+  } catch {
+    return null;
+  }
+  return validateTaskWorktreeRecord(record);
+}
+
+/**
  * Whether a tool call is confined to the agent's currently active, verified
  * task worktree (see `cortextos bus task-worktree start`/`finish`).
  *
@@ -377,12 +397,14 @@ function getActiveTaskWorktree(agentDir: string): ActiveTaskWorktree | null {
  * isClaudeDirOperation. Bash is NOT — Claude Code's Bash tool carries no
  * per-call working directory, and this hook runs as a stateless subprocess
  * per call, so there's no reliable signal to confine a shell command to the
- * worktree. While a task is active, Bash is trusted unconditionally; this is
- * a deliberate, wider trust grant accepted for the task's duration (see
- * design discussion — a scoped/allowlisted Bash was considered and rejected
- * as not enforceable). Calling `task-worktree finish` deletes the state file
- * BEFORE computing anything else, closing this window immediately — so a
- * subsequent merge/deploy step always goes through the normal Telegram gate.
+ * worktree. A scoped/allowlisted Bash was considered and rejected: neither
+ * a cwd check (no signal to check) nor a command allowlist (defeatable by
+ * shell metacharacters) can actually enforce containment, so while a task is
+ * active, Bash is trusted unconditionally — a deliberate, wider trust grant
+ * accepted for the task's duration. Calling `task-worktree finish` deletes
+ * the state file BEFORE computing anything else, closing this window
+ * immediately — so a subsequent merge/deploy step always goes through the
+ * normal Telegram gate.
  */
 export function isTaskWorktreeOperation(
   toolName: string,

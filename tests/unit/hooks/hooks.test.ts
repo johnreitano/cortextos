@@ -9,6 +9,7 @@ import {
   formatToolSummary,
   isClaudeDirOperation,
   isTaskWorktreeOperation,
+  validateTaskWorktreeRecord,
   sanitizeCodeBlock,
   buildPermissionKeyboard,
   buildPlanKeyboard,
@@ -351,6 +352,66 @@ describe('Hook Utilities', () => {
       } finally {
         rmSync(base, { recursive: true, force: true });
       }
+    });
+
+    it('refuses a write that escapes the worktree via a symlink inside it', () => {
+      const { base, worktreePath, agentDir } = makeActiveTaskWorktree();
+      try {
+        const outside = join(base, 'outside');
+        mkdirSync(outside, { recursive: true });
+        symlinkSync(outside, join(worktreePath, 'escape'));
+
+        // A write "inside" escape/ actually lands in outside/ — must be refused.
+        expect(isTaskWorktreeOperation('Write',
+          { file_path: join(worktreePath, 'escape', 'evil.txt') }, agentDir)).toBe(false);
+        // Sanity: a genuine, non-symlinked file directly inside the worktree is still allowed.
+        expect(isTaskWorktreeOperation('Write',
+          { file_path: join(worktreePath, 'ok.txt') }, agentDir)).toBe(true);
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+
+    it('refuses the sibling-prefix trick (worktree-decoy is not the worktree)', () => {
+      const { base, worktreePath, agentDir } = makeActiveTaskWorktree();
+      try {
+        const decoy = `${worktreePath}-decoy`;
+        mkdirSync(decoy, { recursive: true });
+        expect(isTaskWorktreeOperation('Write', { file_path: join(decoy, 'x.ts') }, agentDir)).toBe(false);
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+
+    it('refuses a record with path/repo swapped', () => {
+      const { base, repo, worktreePath, agentDir } = makeActiveTaskWorktree();
+      try {
+        writeFileSync(
+          join(agentDir, '.claude', 'state', 'active-task-worktree.json'),
+          JSON.stringify({ repo: worktreePath, path: repo, branch: 'task/demo', taskName: 'demo' }),
+        );
+        expect(isTaskWorktreeOperation('Bash', { command: 'ls' }, agentDir)).toBe(false);
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('validateTaskWorktreeRecord', () => {
+    it('rejects null, non-object, and missing/wrong-typed fields', () => {
+      expect(validateTaskWorktreeRecord(null)).toBeNull();
+      expect(validateTaskWorktreeRecord(undefined)).toBeNull();
+      expect(validateTaskWorktreeRecord('a string')).toBeNull();
+      expect(validateTaskWorktreeRecord([])).toBeNull();
+      expect(validateTaskWorktreeRecord({})).toBeNull();
+      expect(validateTaskWorktreeRecord({ path: '/a', repo: '/b', branch: 'x' })).toBeNull(); // missing taskName
+      expect(validateTaskWorktreeRecord({ path: 1, repo: '/b', branch: 'x', taskName: 'y' })).toBeNull(); // wrong type
+      expect(validateTaskWorktreeRecord({ path: '/a', repo: '/b', branch: 'x', taskName: null })).toBeNull();
+    });
+
+    it('rejects main/master branches independent of path validity', () => {
+      expect(validateTaskWorktreeRecord({ path: '/a', repo: '/b', branch: 'main', taskName: 'x' })).toBeNull();
+      expect(validateTaskWorktreeRecord({ path: '/a', repo: '/b', branch: 'master', taskName: 'x' })).toBeNull();
     });
   });
 

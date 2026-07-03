@@ -1166,7 +1166,13 @@ busCommand
           const result = await finishTaskWorktree(
             agentDir, paths, env.agentName, env.org, options.abandon ? 'abandon' : 'merge', env.frameworkRoot,
           );
-          console.log(`Task worktree closed. ${result.commits} commit(s), ${result.diffStat || 'no diff stat'}.`);
+          const status = result.worktreeRemoved
+            ? 'Task worktree closed.'
+            : 'Task worktree trust revoked, but the on-disk worktree could not be removed automatically — remove it manually with `git worktree remove --force`.';
+          console.log(`${status} ${result.commits} commit(s), ${result.diffStat}.`);
+          if (result.branchDeleted === false) {
+            console.log('WARNING: the task branch could not be deleted — remove it manually with `git branch -D`.');
+          }
           if (result.approvalId) console.log(`Approval requested: ${result.approvalId}`);
         } catch (err: any) {
           console.error(`Failed to finish task worktree: ${err.message || err}`);

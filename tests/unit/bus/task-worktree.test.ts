@@ -18,11 +18,34 @@ vi.mock('../../../src/telegram/api', () => ({
   },
 }));
 
+// Records call order across the real 'fs'/'child_process' modules so the
+// "state file deleted before any git command" guarantee can be verified by
+// actual call sequence, not by timing relative to `await` — everything in
+// finishTaskWorktree up to its first await runs synchronously in one tick,
+// so checking existsSync() right after calling (without awaiting) can't
+// distinguish "deleted first" from "deleted last, still before the await."
+let callOrder: string[] = [];
+vi.mock('fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs')>();
+  return { ...actual, rmSync: (...args: Parameters<typeof actual.rmSync>) => {
+    callOrder.push('rmSync');
+    return actual.rmSync(...args);
+  } };
+});
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('child_process')>();
+  return { ...actual, execFileSync: (...args: Parameters<typeof actual.execFileSync>) => {
+    callOrder.push(`execFileSync:${args[0]}:${(args[1] as string[])?.[0] || ''}`);
+    return actual.execFileSync(...args);
+  } };
+});
+
 import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
 import { startTaskWorktree, finishTaskWorktree } from '../../../src/bus/task-worktree';
+import { canonicalizePath } from '../../../src/hooks/index';
 import type { BusPaths } from '../../../src/types';
 
 let base: string;
@@ -50,7 +73,13 @@ function statePath(): string {
 }
 
 beforeEach(() => {
-  base = mkdtempSync(join(tmpdir(), 'cortextos-taskwt-test-'));
+  // Canonicalized immediately — startTaskWorktree canonicalizes the repo
+  // path too (so its worktree-path basename matches what
+  // validateTaskWorktreeRecord re-derives on every read), which on macOS
+  // means tmpdir()'s /var/folders/... resolves to /private/var/folders/....
+  // Comparing against a canonicalized `base` throughout keeps every
+  // downstream path assertion consistent with what the code actually does.
+  base = canonicalizePath(mkdtempSync(join(tmpdir(), 'cortextos-taskwt-test-')));
   repo = join(base, 'repo');
   mkdirSync(repo, { recursive: true });
   execFileSync('git', ['init', '-q'], { cwd: repo });
@@ -127,11 +156,18 @@ describe('finishTaskWorktree', () => {
     expect(existsSync(statePath())).toBe(true);
     const resultPromise = finishTaskWorktree(agentDir, paths, 'orchestrator', 'leadio', 'merge');
     // The state file must already be gone synchronously, before the async
-    // approval-creation work even starts — this is the load-bearing
-    // ordering guarantee the whole design depends on.
+    // approval-creation work even starts.
     expect(existsSync(statePath())).toBe(false);
     await resultPromise;
     expect(existsSync(worktreePath)).toBe(false);
+  });
+
+  it('calls rmSync on the state file before any git command runs — the actual load-bearing ordering guarantee', async () => {
+    startTaskWorktree(agentDir, repo, 'demo');
+    callOrder = []; // only care about calls made by this finishTaskWorktree invocation
+    await finishTaskWorktree(agentDir, paths, 'orchestrator', 'leadio', 'merge');
+    expect(callOrder[0]).toBe('rmSync');
+    expect(callOrder.slice(1).every(c => c.startsWith('execFileSync'))).toBe(true);
   });
 
   it('removes the worktree and requests a merge approval by default', async () => {
@@ -144,6 +180,7 @@ describe('finishTaskWorktree', () => {
     expect(existsSync(worktreePath)).toBe(false);
     expect(result.commits).toBe(1);
     expect(result.approvalId).toBeTruthy();
+    expect(result.worktreeRemoved).toBe(true);
     // Branch itself must survive a 'merge' finish — only the worktree checkout is removed.
     const branches = execFileSync('git', ['branch', '--list', branch], { cwd: repo, encoding: 'utf-8' });
     expect(branches).toContain(branch.replace('task/', ''));
@@ -154,7 +191,44 @@ describe('finishTaskWorktree', () => {
     const result = await finishTaskWorktree(agentDir, paths, 'orchestrator', 'leadio', 'abandon');
     expect(existsSync(worktreePath)).toBe(false);
     expect(result.approvalId).toBeUndefined();
+    expect(result.worktreeRemoved).toBe(true);
+    expect(result.branchDeleted).toBe(true);
     const branches = execFileSync('git', ['branch', '--list', branch], { cwd: repo, encoding: 'utf-8' });
     expect(branches.trim()).toBe('');
+  });
+
+  it('refuses to run any git operation against a tampered state file, even though the trust window is still revoked', async () => {
+    const { path: worktreePath, branch } = startTaskWorktree(agentDir, repo, 'demo');
+    // Hand-craft the record to name main as its branch — exactly the kind
+    // of tampering validateTaskWorktreeRecord exists to catch. Everything
+    // else about the record is otherwise "valid-looking."
+    writeFileSync(statePath(), JSON.stringify({
+      repo, path: worktreePath, branch: 'main', taskName: 'demo', startedAt: new Date().toISOString(),
+    }));
+
+    await expect(finishTaskWorktree(agentDir, paths, 'orchestrator', 'leadio', 'abandon'))
+      .rejects.toThrow(/failed validation/);
+
+    // Trust window closed regardless (state file gone)...
+    expect(existsSync(statePath())).toBe(false);
+    // ...but no destructive git operation ran: the worktree and its real
+    // branch (task/demo, not the tampered "main") are untouched.
+    expect(existsSync(worktreePath)).toBe(true);
+    const branches = execFileSync('git', ['branch', '--list', branch], { cwd: repo, encoding: 'utf-8' });
+    expect(branches).toContain('demo');
+  });
+
+  it('refuses a record whose repo does not match where the worktree was actually registered', async () => {
+    const { path: worktreePath } = startTaskWorktree(agentDir, repo, 'demo');
+    const otherRepo = join(base, 'other-repo');
+    mkdirSync(otherRepo, { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: otherRepo });
+    writeFileSync(statePath(), JSON.stringify({
+      repo: otherRepo, path: worktreePath, branch: 'task/demo', taskName: 'demo', startedAt: new Date().toISOString(),
+    }));
+
+    await expect(finishTaskWorktree(agentDir, paths, 'orchestrator', 'leadio', 'abandon'))
+      .rejects.toThrow(/failed validation/);
+    expect(existsSync(worktreePath)).toBe(true);
   });
 });
