@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, symlinkSync } from 'fs';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
 import {
@@ -10,6 +10,7 @@ import {
   isClaudeDirOperation,
   isTaskWorktreeOperation,
   validateTaskWorktreeRecord,
+  canonicalizePath,
   sanitizeCodeBlock,
   buildPermissionKeyboard,
   buildPlanKeyboard,
@@ -18,6 +19,35 @@ import {
   buildAskState,
   formatQuestionMessage,
 } from '../../../src/hooks/index';
+
+// Builds a real git repo with one commit, a real worktree created the same
+// way `cortextos bus task-worktree start` would, and a matching state file
+// — so tests using this exercise the actual git-worktree-list cross-check,
+// not just the path-containment math. Shared across describe blocks below.
+function makeActiveTaskWorktree(branch = 'task/demo') {
+  const base = mkdtempSync(join(tmpdir(), 'hookperm-taskwt-'));
+  const repo = join(base, 'repo');
+  mkdirSync(repo, { recursive: true });
+  execFileSync('git', ['init', '-q'], { cwd: repo });
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
+  writeFileSync(join(repo, 'README.md'), 'hello');
+  execFileSync('git', ['add', '.'], { cwd: repo });
+  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: repo });
+
+  const worktreePath = join(base, '.cortextos-task-worktrees', 'repo', 'demo');
+  mkdirSync(join(base, '.cortextos-task-worktrees', 'repo'), { recursive: true });
+  execFileSync('git', ['worktree', 'add', worktreePath, '-b', branch], { cwd: repo });
+
+  const agentDir = join(base, 'agent');
+  mkdirSync(join(agentDir, '.claude', 'state'), { recursive: true });
+  writeFileSync(
+    join(agentDir, '.claude', 'state', 'active-task-worktree.json'),
+    JSON.stringify({ repo, path: worktreePath, branch, taskName: 'demo' }),
+  );
+
+  return { base, repo, worktreePath, agentDir };
+}
 
 describe('Hook Utilities', () => {
   describe('parseHookInput', () => {
@@ -223,34 +253,6 @@ describe('Hook Utilities', () => {
   });
 
   describe('isTaskWorktreeOperation', () => {
-    // Builds a real git repo with one commit, a real worktree created the
-    // same way `cortextos bus task-worktree start` would, and a matching
-    // state file — so these tests exercise the actual git-worktree-list
-    // cross-check, not just the path-containment math.
-    function makeActiveTaskWorktree(branch = 'task/demo') {
-      const base = mkdtempSync(join(tmpdir(), 'hookperm-taskwt-'));
-      const repo = join(base, 'repo');
-      mkdirSync(repo, { recursive: true });
-      execFileSync('git', ['init', '-q'], { cwd: repo });
-      execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
-      execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
-      writeFileSync(join(repo, 'README.md'), 'hello');
-      execFileSync('git', ['add', '.'], { cwd: repo });
-      execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: repo });
-
-      const worktreePath = join(base, '.cortextos-task-worktrees', 'repo', 'demo');
-      mkdirSync(join(base, '.cortextos-task-worktrees', 'repo'), { recursive: true });
-      execFileSync('git', ['worktree', 'add', worktreePath, '-b', branch], { cwd: repo });
-
-      const agentDir = join(base, 'agent');
-      mkdirSync(join(agentDir, '.claude', 'state'), { recursive: true });
-      writeFileSync(
-        join(agentDir, '.claude', 'state', 'active-task-worktree.json'),
-        JSON.stringify({ repo, path: worktreePath, branch, taskName: 'demo' }),
-      );
-
-      return { base, repo, worktreePath, agentDir };
-    }
 
     it('returns false when there is no active task worktree', () => {
       const base = mkdtempSync(join(tmpdir(), 'hookperm-taskwt-'));
@@ -427,8 +429,9 @@ describe('Hook Utilities', () => {
       // 'demo' — those only ever fail, if at all, for unrelated reasons).
     });
 
-    it('distinguishes "not a registered worktree" from "registered but detached" and rejects both', () => {
+    it('rejects a registered-but-detached worktree, logging the detached-specific message', () => {
       const base = mkdtempSync(join(tmpdir(), 'hookperm-taskwt-detached-'));
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
       try {
         const repo = join(base, 'repo');
         mkdirSync(repo, { recursive: true });
@@ -444,9 +447,84 @@ describe('Hook Utilities', () => {
         // Detached — no -b, just checks out the current commit directly.
         execFileSync('git', ['worktree', 'add', '--detach', worktreePath], { cwd: repo });
 
+        errorSpy.mockClear();
         expect(validateTaskWorktreeRecord({
           repo, path: worktreePath, branch: 'task/demo', taskName: 'demo',
         })).toBeNull();
+        const logged = errorSpy.mock.calls.map(c => c.join(' ')).join('\n');
+        expect(logged).toMatch(/detached/);
+        expect(logged).not.toMatch(/not a currently registered/);
+      } finally {
+        errorSpy.mockRestore();
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects a path that is not a registered worktree at all, logging the not-registered message (distinct from detached)', () => {
+      const base = mkdtempSync(join(tmpdir(), 'hookperm-taskwt-notreg-'));
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const repo = join(base, 'repo');
+        mkdirSync(repo, { recursive: true });
+        execFileSync('git', ['init', '-q'], { cwd: repo });
+        execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
+        execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
+        writeFileSync(join(repo, 'README.md'), 'hello');
+        execFileSync('git', ['add', '.'], { cwd: repo });
+        execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: repo });
+
+        // A directory that exists but was never registered via `git worktree add`.
+        const fakePath = join(base, '.cortextos-task-worktrees', 'repo', 'demo');
+        mkdirSync(fakePath, { recursive: true });
+
+        errorSpy.mockClear();
+        expect(validateTaskWorktreeRecord({
+          repo, path: fakePath, branch: 'task/demo', taskName: 'demo',
+        })).toBeNull();
+        const logged = errorSpy.mock.calls.map(c => c.join(' ')).join('\n');
+        expect(logged).toMatch(/not a currently registered/);
+        expect(logged).not.toMatch(/detached/);
+      } finally {
+        errorSpy.mockRestore();
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects a record whose taskName does not match the worktree path it claims, even with a real path/branch/repo', () => {
+      const { base, repo, worktreePath, agentDir } = makeActiveTaskWorktree();
+      try {
+        // Everything is genuinely real and registered — only taskName lies.
+        writeFileSync(
+          join(agentDir, '.claude', 'state', 'active-task-worktree.json'),
+          JSON.stringify({ repo, path: worktreePath, branch: 'task/demo', taskName: 'totally-different-task' }),
+        );
+        expect(isTaskWorktreeOperation('Bash', { command: 'ls' }, agentDir)).toBe(false);
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects a repo that is not itself a git repository root', () => {
+      const base = mkdtempSync(join(tmpdir(), 'hookperm-taskwt-notroot-'));
+      try {
+        const notRepo = join(base, 'not-a-repo');
+        mkdirSync(notRepo, { recursive: true });
+        expect(validateTaskWorktreeRecord({
+          repo: notRepo, path: join(base, '.cortextos-task-worktrees', 'not-a-repo', 'demo'),
+          branch: 'task/demo', taskName: 'demo',
+        })).toBeNull();
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+
+    it('returns the canonicalized repo, not the raw input, on success', () => {
+      const { base, repo, worktreePath, agentDir } = makeActiveTaskWorktree();
+      try {
+        const record = JSON.parse(readFileSync(join(agentDir, '.claude', 'state', 'active-task-worktree.json'), 'utf-8'));
+        const validated = validateTaskWorktreeRecord(record);
+        expect(validated).not.toBeNull();
+        expect(validated!.repo).toBe(canonicalizePath(resolve(repo)));
       } finally {
         rmSync(base, { recursive: true, force: true });
       }

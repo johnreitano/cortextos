@@ -330,4 +330,27 @@ describe('finishTaskWorktree', () => {
     // Sanitization doesn't just delete the whole value — the safe parts survive.
     expect(title).toContain('featureevilxy');
   });
+
+  it('strips Markdown-significant characters from the repo path too, not just branch', async () => {
+    // POSIX directory names can legally contain backtick/paren/underscore —
+    // nothing about the repo-directory charset is restricted the way
+    // taskName is, so this needs the same sanitization treatment.
+    const dangerousRepo = join(base, 'repo`evil`(x)_y');
+    mkdirSync(dangerousRepo, { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: dangerousRepo });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dangerousRepo });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dangerousRepo });
+    writeFileSync(join(dangerousRepo, 'README.md'), 'hello');
+    execFileSync('git', ['add', '.'], { cwd: dangerousRepo });
+    execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: dangerousRepo });
+
+    startTaskWorktree(agentDir, dangerousRepo, 'demo');
+    createApprovalSpy.mockClear();
+    await finishTaskWorktree(agentDir, paths, 'orchestrator', 'leadio', 'merge');
+
+    expect(createApprovalSpy).toHaveBeenCalledTimes(1);
+    const [, , , , , context] = createApprovalSpy.mock.calls[0];
+    expect(context).not.toContain(dangerousRepo);
+    expect(context).not.toMatch(/`/);
+  });
 });

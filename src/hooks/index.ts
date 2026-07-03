@@ -319,9 +319,11 @@ export interface ActiveTaskWorktree {
 
 /**
  * Validate an already-parsed task-worktree record. Returns null if it's
- * malformed, names main/master as its branch, its path fails verification
- * against the repo's actual `git worktree list` output, or its branch
- * doesn't match the branch actually checked out at that path.
+ * malformed, its `taskName` contains characters outside
+ * `[a-zA-Z0-9_-]`, it names main/master as its branch, its `repo` isn't a
+ * git repository root, its `path` doesn't match the expected location for
+ * its own `taskName`, or its `branch` doesn't match the branch actually
+ * checked out at that path.
  *
  * This is the ONE validator used on every read of
  * `.claude/state/active-task-worktree.json`, by both the permission hook
@@ -334,13 +336,17 @@ export interface ActiveTaskWorktree {
  * trusting an agent-supplied path/branch/repo outright; sharing this
  * function is what closes that gap for both.
  *
- * The path and branch checks are deliberately independent AND
- * cross-referenced: verifying `path` alone isn't enough, because a record
- * could keep a real, previously-verified `path` but swap in an unrelated
- * `branch` — e.g. to make `finishTaskWorktree`'s `git branch -D` on the
- * abandon path force-delete an arbitrary branch that has nothing to do
- * with the sanctioned worktree. Requiring `record.branch` to equal the
- * branch `git worktree list` reports for that exact path closes that.
+ * Every field that can be cross-referenced against reality IS
+ * cross-referenced, deliberately: verifying `path` alone isn't enough,
+ * because a record could keep a real, previously-verified `path` but swap
+ * in an unrelated `branch` — e.g. to make `finishTaskWorktree`'s
+ * `git branch -D` on the abandon path force-delete an arbitrary branch
+ * that has nothing to do with the sanctioned worktree — or an unrelated
+ * `taskName`, misleading whoever reads it in the human-facing
+ * merge-approval text about what's actually being merged. `path` is
+ * required to be the EXACT location `worktreeRootFor` would derive for
+ * `record.taskName`, and `branch` is required to equal what
+ * `git worktree list` reports for that exact path.
  *
  * Every rejection is logged (stderr — stdout is reserved for the hook's
  * JSON decision protocol) so a legitimate operational failure (git
@@ -380,10 +386,20 @@ export function validateTaskWorktreeRecord(record: any): ActiveTaskWorktree | nu
   }
 
   const canonRepo = canonicalizePath(resolve(record.repo));
-  const expectedRoot = join(dirname(canonRepo), '.cortextos-task-worktrees', basename(canonRepo));
+  if (!existsSync(join(canonRepo, '.git'))) {
+    console.error(`task-worktree: rejecting record — repo is not a git repository root: ${canonRepo}`);
+    return null;
+  }
+  // Pinned to taskName, not just the repo's task-worktrees root — otherwise
+  // a record could pair a real, legitimately-registered worktree's path
+  // with an unrelated taskName, misleading whoever reads the taskName in
+  // the human-facing merge-approval text about what's actually being
+  // merged. Mirrors worktreeRootFor's convention exactly
+  // (src/bus/task-worktree.ts) so a legitimately-started task always matches.
+  const expectedPath = join(dirname(canonRepo), '.cortextos-task-worktrees', basename(canonRepo), record.taskName);
   const canonPath = canonicalizePath(resolve(record.path));
-  if (canonPath !== expectedRoot && !canonPath.startsWith(expectedRoot + sep)) {
-    console.error(`task-worktree: rejecting record — path is not under the expected root ${expectedRoot}`);
+  if (canonPath !== expectedPath) {
+    console.error(`task-worktree: rejecting record — path does not match the expected location for taskName "${record.taskName}"`);
     return null;
   }
 
@@ -430,9 +446,11 @@ export function validateTaskWorktreeRecord(record: any): ActiveTaskWorktree | nu
 
 /**
  * Read and validate the active task-worktree record for an agent, if any.
- * Returns null if there is no active task, the record is malformed, its
- * branch is main/master, or the recorded path fails verification against
- * the repo's actual worktree list — see `validateTaskWorktreeRecord`.
+ * Returns null if there is no active task, the file can't be read/parsed,
+ * or the record fails any of `validateTaskWorktreeRecord`'s checks
+ * (malformed, disallowed taskName characters, main/master branch, path
+ * not matching its own taskName, or branch not matching the worktree's
+ * actual branch).
  */
 export function getActiveTaskWorktree(agentDir: string): ActiveTaskWorktree | null {
   const statePath = join(agentDir, '.claude', 'state', 'active-task-worktree.json');
