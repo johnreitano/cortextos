@@ -84,16 +84,19 @@ export const ecosystemCommand = new Command('ecosystem')
     // via `pm2 startup`/`pm2 save`. The dashboard PM2 entry is only added
     // if dashboard/package.json exists (to keep the generator working in
     // minimal/test installs).
-    // PM2 on Windows can't execute `npm` directly — `npm.cmd` is a Windows
-    // .cmd shim that PM2's node-based loader tries to interpret as JS, which
-    // fails immediately ("Unexpected token ':'"). Bypass the shim by pointing
-    // PM2 at the local Next.js binary that `npm run dev` would run anyway.
-    // The `next` entry resolves under dashboard/node_modules/next/dist/bin/next
-    // and is just a Node script, so PM2 spawns it cleanly on every platform.
-    const isWindows = process.platform === 'win32';
+    // PM2 can't always execute `npm` directly — on Windows, `npm.cmd` is a
+    // .cmd shim; on Unix systems using a version manager with shim-based
+    // shells (e.g. asdf), `npm` on PATH is a bash script, not a real
+    // executable. Either way, PM2's fork-mode loader tries to `require()`
+    // the script as JS and fails immediately ("Unexpected token ':'" on
+    // Windows, "Unexpected identifier 'pipefail'" with asdf). Bypass the
+    // shim entirely by pointing PM2 at the local Next.js binary that
+    // `npm run dev` would run anyway. The `next` entry resolves under
+    // dashboard/node_modules/next/dist/bin/next and is just a Node script,
+    // so PM2 spawns it cleanly regardless of platform or npm shim.
     const nextBin = join(dashboardDir, 'node_modules', 'next', 'dist', 'bin', 'next');
-    const dashboardScript = isWindows && existsSync(nextBin) ? nextBin : 'npm';
-    const dashboardArgs = isWindows && existsSync(nextBin) ? 'dev' : 'run dev';
+    const dashboardScript = existsSync(nextBin) ? nextBin : 'npm';
+    const dashboardArgs = existsSync(nextBin) ? 'dev' : 'run dev';
 
     // windowsHide: stops PM2 from attaching a visible "next-server" console
     // window to the dashboard process at boot on Windows. PM2's default
