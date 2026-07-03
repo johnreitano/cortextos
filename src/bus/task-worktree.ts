@@ -16,20 +16,14 @@
  * just one.
  */
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'fs';
-import { join, dirname, basename, resolve } from 'path';
+import { join, dirname, resolve } from 'path';
 import { execFileSync } from 'child_process';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { createApproval } from './approval.js';
-import { validateTaskWorktreeRecord, canonicalizePath } from '../hooks/index.js';
+import { validateTaskWorktreeRecord, canonicalizePath, worktreeRootFor, type ActiveTaskWorktree } from '../hooks/index.js';
 import type { BusPaths } from '../types/index.js';
 
-interface TaskWorktreeState {
-  repo: string;
-  path: string;
-  branch: string;
-  taskName: string;
-  startedAt: string;
-}
+type TaskWorktreeState = ActiveTaskWorktree;
 
 function statePath(agentDir: string): string {
   return join(agentDir, '.claude', 'state', 'active-task-worktree.json');
@@ -48,18 +42,6 @@ function statePath(agentDir: string): string {
  */
 function sanitizeForApprovalText(value: string): string {
   return value.replace(/[`[\]()*_]/g, '');
-}
-
-/**
- * Fixed, repo-derived root — only the final path segment (taskName) is
- * agent-supplied, and it must already have passed the letters/numbers/
- * hyphen/underscore check in startTaskWorktree before reaching here; this
- * function does not re-validate it. `resolvedRepo` must already be
- * canonicalized (see startTaskWorktree) so this basename matches the one
- * `validateTaskWorktreeRecord` re-derives on every read.
- */
-function worktreeRootFor(resolvedRepo: string, taskName: string): string {
-  return join(dirname(resolvedRepo), '.cortextos-task-worktrees', basename(resolvedRepo), taskName);
 }
 
 export function startTaskWorktree(
@@ -200,10 +182,10 @@ export async function finishTaskWorktree(
       'See stderr/logs for the specific validation failure.',
     );
   }
-  const state: TaskWorktreeState = {
-    ...validated,
-    startedAt: typeof rawState.startedAt === 'string' ? rawState.startedAt : new Date().toISOString(),
-  };
+  // validated (an ActiveTaskWorktree) already includes a type-checked
+  // startedAt — no separate pull from rawState or fallback default needed
+  // now that validateTaskWorktreeRecord covers this field too.
+  const state: TaskWorktreeState = validated;
 
   let diffStat = '(diff summary unavailable)';
   let commits: number | null = null;

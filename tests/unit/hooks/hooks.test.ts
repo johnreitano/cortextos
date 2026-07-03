@@ -43,7 +43,7 @@ function makeActiveTaskWorktree(branch = 'task/demo') {
   mkdirSync(join(agentDir, '.claude', 'state'), { recursive: true });
   writeFileSync(
     join(agentDir, '.claude', 'state', 'active-task-worktree.json'),
-    JSON.stringify({ repo, path: worktreePath, branch, taskName: 'demo' }),
+    JSON.stringify({ repo, path: worktreePath, branch, taskName: 'demo', startedAt: new Date().toISOString() }),
   );
 
   return { base, repo, worktreePath, agentDir };
@@ -314,7 +314,7 @@ describe('Hook Utilities', () => {
         mkdirSync(join(agentDir, '.claude', 'state'), { recursive: true });
         writeFileSync(
           join(agentDir, '.claude', 'state', 'active-task-worktree.json'),
-          JSON.stringify({ repo: base, path: join(base, 'wt'), branch: 'main', taskName: 'demo' }),
+          JSON.stringify({ repo: base, path: join(base, 'wt'), branch: 'main', taskName: 'demo', startedAt: new Date().toISOString() }),
         );
         expect(isTaskWorktreeOperation('Bash', { command: 'ls' }, agentDir)).toBe(false);
         expect(isTaskWorktreeOperation('Write', { file_path: join(base, 'wt', 'x.ts') }, agentDir)).toBe(false);
@@ -330,7 +330,7 @@ describe('Hook Utilities', () => {
         // trying to escalate its own trust by hand-editing the record.
         writeFileSync(
           join(agentDir, '.claude', 'state', 'active-task-worktree.json'),
-          JSON.stringify({ repo, path: '/tmp', branch: 'task/demo', taskName: 'demo' }),
+          JSON.stringify({ repo, path: '/tmp', branch: 'task/demo', taskName: 'demo', startedAt: new Date().toISOString() }),
         );
         expect(isTaskWorktreeOperation('Bash', { command: 'ls' }, agentDir)).toBe(false);
       } finally {
@@ -348,7 +348,7 @@ describe('Hook Utilities', () => {
         mkdirSync(fakePath, { recursive: true });
         writeFileSync(
           join(agentDir, '.claude', 'state', 'active-task-worktree.json'),
-          JSON.stringify({ repo, path: fakePath, branch: 'task/not-real', taskName: 'not-real' }),
+          JSON.stringify({ repo, path: fakePath, branch: 'task/not-real', taskName: 'not-real', startedAt: new Date().toISOString() }),
         );
         expect(isTaskWorktreeOperation('Bash', { command: 'ls' }, agentDir)).toBe(false);
       } finally {
@@ -390,7 +390,7 @@ describe('Hook Utilities', () => {
       try {
         writeFileSync(
           join(agentDir, '.claude', 'state', 'active-task-worktree.json'),
-          JSON.stringify({ repo: worktreePath, path: repo, branch: 'task/demo', taskName: 'demo' }),
+          JSON.stringify({ repo: worktreePath, path: repo, branch: 'task/demo', taskName: 'demo', startedAt: new Date().toISOString() }),
         );
         expect(isTaskWorktreeOperation('Bash', { command: 'ls' }, agentDir)).toBe(false);
       } finally {
@@ -412,8 +412,9 @@ describe('Hook Utilities', () => {
     });
 
     it('rejects main/master branches independent of path validity', () => {
-      expect(validateTaskWorktreeRecord({ path: '/a', repo: '/b', branch: 'main', taskName: 'x' })).toBeNull();
-      expect(validateTaskWorktreeRecord({ path: '/a', repo: '/b', branch: 'master', taskName: 'x' })).toBeNull();
+      const startedAt = new Date().toISOString();
+      expect(validateTaskWorktreeRecord({ path: '/a', repo: '/b', branch: 'main', taskName: 'x', startedAt })).toBeNull();
+      expect(validateTaskWorktreeRecord({ path: '/a', repo: '/b', branch: 'master', taskName: 'x', startedAt })).toBeNull();
     });
 
     it('rejects a taskName containing characters outside the letters/numbers/hyphen/underscore charset', () => {
@@ -422,8 +423,9 @@ describe('Hook Utilities', () => {
       // approval message — so it's charset-restricted here to rule out
       // Markdown control characters at the source, matching the same
       // regex startTaskWorktree enforces at write time.
-      expect(validateTaskWorktreeRecord({ path: '/a', repo: '/b', branch: 'x', taskName: 'a`b' })).toBeNull();
-      expect(validateTaskWorktreeRecord({ path: '/a', repo: '/b', branch: 'x', taskName: '[link](evil)' })).toBeNull();
+      const startedAt = new Date().toISOString();
+      expect(validateTaskWorktreeRecord({ path: '/a', repo: '/b', branch: 'x', taskName: 'a`b', startedAt })).toBeNull();
+      expect(validateTaskWorktreeRecord({ path: '/a', repo: '/b', branch: 'x', taskName: '[link](evil)', startedAt })).toBeNull();
       // A charset-compliant taskName passes THIS check (proven by every
       // other test in this file using a real worktree with taskName
       // 'demo' — those only ever fail, if at all, for unrelated reasons).
@@ -449,7 +451,7 @@ describe('Hook Utilities', () => {
 
         errorSpy.mockClear();
         expect(validateTaskWorktreeRecord({
-          repo, path: worktreePath, branch: 'task/demo', taskName: 'demo',
+          repo, path: worktreePath, branch: 'task/demo', taskName: 'demo', startedAt: new Date().toISOString(),
         })).toBeNull();
         const logged = errorSpy.mock.calls.map(c => c.join(' ')).join('\n');
         expect(logged).toMatch(/detached/);
@@ -479,7 +481,7 @@ describe('Hook Utilities', () => {
 
         errorSpy.mockClear();
         expect(validateTaskWorktreeRecord({
-          repo, path: fakePath, branch: 'task/demo', taskName: 'demo',
+          repo, path: fakePath, branch: 'task/demo', taskName: 'demo', startedAt: new Date().toISOString(),
         })).toBeNull();
         const logged = errorSpy.mock.calls.map(c => c.join(' ')).join('\n');
         expect(logged).toMatch(/not a currently registered/);
@@ -496,7 +498,7 @@ describe('Hook Utilities', () => {
         // Everything is genuinely real and registered — only taskName lies.
         writeFileSync(
           join(agentDir, '.claude', 'state', 'active-task-worktree.json'),
-          JSON.stringify({ repo, path: worktreePath, branch: 'task/demo', taskName: 'totally-different-task' }),
+          JSON.stringify({ repo, path: worktreePath, branch: 'task/demo', taskName: 'totally-different-task', startedAt: new Date().toISOString() }),
         );
         expect(isTaskWorktreeOperation('Bash', { command: 'ls' }, agentDir)).toBe(false);
       } finally {
@@ -511,7 +513,7 @@ describe('Hook Utilities', () => {
         mkdirSync(notRepo, { recursive: true });
         expect(validateTaskWorktreeRecord({
           repo: notRepo, path: join(base, '.cortextos-task-worktrees', 'not-a-repo', 'demo'),
-          branch: 'task/demo', taskName: 'demo',
+          branch: 'task/demo', taskName: 'demo', startedAt: new Date().toISOString(),
         })).toBeNull();
       } finally {
         rmSync(base, { recursive: true, force: true });
