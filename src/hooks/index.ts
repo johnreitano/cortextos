@@ -270,8 +270,16 @@ export function isClaudeDirOperation(
 /**
  * Whether any path component strictly below `rootDir` (assumed already
  * canonical) up to and including `target` is a symlink (live or dangling).
- * Stops at the first non-existent component — a name that doesn't exist yet
- * cannot be a symlink, and deeper components can't exist under it.
+ * Stops at the first non-existent component (ENOENT) — a name that doesn't
+ * exist yet cannot be a symlink, and deeper components can't exist under it.
+ *
+ * Any OTHER lstat failure (EACCES, ENOTDIR, ELOOP — an actual symlink loop,
+ * the exact hazard this function exists to catch) is NOT treated as
+ * "benign, keep going": it fails closed by returning true, so the caller
+ * treats the path as untrusted rather than silently reporting "no symlink
+ * found" when the check genuinely couldn't be completed. This matters more
+ * now than when the function was first written, since it backs both
+ * `.claude/` containment AND the task-worktree trust grant.
  */
 function hasSymlinkComponent(rootDir: string, target: string): boolean {
   if (!target.startsWith(rootDir + sep)) return false;
@@ -281,8 +289,10 @@ function hasSymlinkComponent(rootDir: string, target: string): boolean {
     cur = join(cur, part);
     try {
       if (lstatSync(cur).isSymbolicLink()) return true;
-    } catch {
-      break;
+    } catch (err: any) {
+      if (err.code === 'ENOENT') break;
+      console.error(`hasSymlinkComponent: unexpected error stat'ing ${cur}: ${err.message || err}`);
+      return true;
     }
   }
   return false;
@@ -325,12 +335,31 @@ export interface ActiveTaskWorktree {
  * invariant can't silently drift by editing one copy and not the other.
  * `resolvedRepo` must already be canonicalized by the caller. Only the
  * final path segment (`taskName`) is agent-supplied, and it must already
- * have passed the letters/numbers/hyphen/underscore check
- * (`startTaskWorktree` enforces this at write time, `validateTaskWorktreeRecord`
- * at read time) before reaching here — this function does not re-validate it.
+ * have passed `isValidTaskName` before reaching here — this function does
+ * not re-validate it.
  */
 export function worktreeRootFor(resolvedRepo: string, taskName: string): string {
   return join(dirname(resolvedRepo), '.cortextos-task-worktrees', basename(resolvedRepo), taskName);
+}
+
+/**
+ * The one taskName charset check, shared by `startTaskWorktree` (write time)
+ * and `validateTaskWorktreeRecord` (read time) — previously hand-duplicated
+ * as an identical regex literal in both files, the same drift risk
+ * `worktreeRootFor` exists to avoid for the path formula.
+ */
+export function isValidTaskName(taskName: string): boolean {
+  return /^[a-zA-Z0-9_-]+$/.test(taskName);
+}
+
+/** Shared main/master blocklist — see the callers for why this check exists. */
+export function isProtectedBranch(branch: string): boolean {
+  return branch === 'main' || branch === 'master';
+}
+
+/** Shared "is this actually a git repository root" check (not just some cwd `git worktree list` happens to accept). */
+export function isGitRepoRoot(resolvedRepo: string): boolean {
+  return existsSync(join(resolvedRepo, '.git'));
 }
 
 /**
@@ -374,6 +403,12 @@ export function worktreeRootFor(resolvedRepo: string, taskName: string): string 
  * timeout, lock file, corrupted repo) isn't indistinguishable from an
  * actual tampered record when someone's troubleshooting `finish`. Trust
  * is fail-closed either way; logging the reason costs nothing security-wise.
+ *
+ * `startedAt` is currently informational only — nothing reads it for a
+ * security decision or staleness/expiry check — but it's still type-checked
+ * here rather than left to bypass validation like the other fields, since
+ * a "validated record" should mean every one of its fields was actually
+ * checked, not "every field except this one, trust it on faith."
  */
 export function validateTaskWorktreeRecord(record: any): ActiveTaskWorktree | null {
   if (
@@ -387,14 +422,14 @@ export function validateTaskWorktreeRecord(record: any): ActiveTaskWorktree | nu
     console.error('task-worktree: rejecting record — missing or wrong-typed field(s)');
     return null;
   }
-  // Same charset `startTaskWorktree` enforces at write time — re-applied
-  // here because taskName is otherwise never cross-checked against
-  // anything (unlike path/branch/repo), and it's interpolated into a
-  // human-facing Telegram approval message. Restricting it to
-  // letters/numbers/hyphens/underscores rules out Markdown control
-  // characters (backticks, brackets, parens, asterisks) at the source,
-  // rather than trying to escape them at every display site.
-  if (!/^[a-zA-Z0-9_-]+$/.test(record.taskName)) {
+  // Applied here (not just at startTaskWorktree's write time) because
+  // taskName is otherwise never cross-checked against anything (unlike
+  // path/branch/repo), and it's interpolated into a human-facing Telegram
+  // approval message. Restricting it to letters/numbers/hyphens/underscores
+  // rules out Markdown control characters (backticks, brackets, parens,
+  // asterisks) at the source, rather than trying to escape them at every
+  // display site.
+  if (!isValidTaskName(record.taskName)) {
     console.error('task-worktree: rejecting record — taskName contains disallowed characters');
     return null;
   }
@@ -402,13 +437,13 @@ export function validateTaskWorktreeRecord(record: any): ActiveTaskWorktree | nu
   // task-worktree trust to a record naming main/master as its branch, even
   // if some future change loosens the other checks — editing/Bash-ing
   // against the repo's mainline branch must never ride on this trust grant.
-  if (record.branch === 'main' || record.branch === 'master') {
+  if (isProtectedBranch(record.branch)) {
     console.error(`task-worktree: rejecting record — branch is ${record.branch}`);
     return null;
   }
 
   const canonRepo = canonicalizePath(resolve(record.repo));
-  if (!existsSync(join(canonRepo, '.git'))) {
+  if (!isGitRepoRoot(canonRepo)) {
     console.error(`task-worktree: rejecting record — repo is not a git repository root: ${canonRepo}`);
     return null;
   }

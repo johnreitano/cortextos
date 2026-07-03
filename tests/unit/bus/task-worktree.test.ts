@@ -24,18 +24,37 @@ vi.mock('../../../src/telegram/api', () => ({
 // finishTaskWorktree up to its first await runs synchronously in one tick,
 // so checking existsSync() right after calling (without awaiting) can't
 // distinguish "deleted first" from "deleted last, still before the await."
+//
+// rmSyncFailureQueue lets individual tests inject a non-ENOENT rmSync
+// failure for the NEXT call only (then reverts to real behavior) — used to
+// test the "failed to revoke trust" and "corrupted file couldn't be
+// removed" paths, neither of which is reachable by any real filesystem
+// state we can portably construct in a test.
 let callOrder: string[] = [];
+const { rmSyncFailureQueue } = vi.hoisted(() => ({ rmSyncFailureQueue: [] as Array<Error> }));
 vi.mock('fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('fs')>();
   return { ...actual, rmSync: (...args: Parameters<typeof actual.rmSync>) => {
     callOrder.push('rmSync');
+    const injected = rmSyncFailureQueue.shift();
+    if (injected) throw injected;
     return actual.rmSync(...args);
   } };
 });
+// execFileSyncFailOn lets a test force specific git subcommands to fail
+// deterministically (matched by their first argv element, e.g. 'remove' or
+// '-D') without needing to construct real git failure conditions — used for
+// the "both rollback steps fail" case, which `git worktree lock` alone
+// doesn't reliably produce for both commands simultaneously.
+const { execFileSyncFailOn } = vi.hoisted(() => ({ execFileSyncFailOn: new Set<string>() }));
 vi.mock('child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('child_process')>();
   return { ...actual, execFileSync: (...args: Parameters<typeof actual.execFileSync>) => {
     callOrder.push(`execFileSync:${args[0]}:${(args[1] as string[])?.[0] || ''}`);
+    const argv = (args[1] as string[]) || [];
+    for (const marker of execFileSyncFailOn) {
+      if (argv.includes(marker)) throw new Error(`injected failure for git ${argv.join(' ')}`);
+    }
     return actual.execFileSync(...args);
   } };
 });
@@ -61,7 +80,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
 import { startTaskWorktree, finishTaskWorktree } from '../../../src/bus/task-worktree';
-import { canonicalizePath } from '../../../src/hooks/index';
+import { canonicalizePath, validateTaskWorktreeRecord } from '../../../src/hooks/index';
 import type { BusPaths } from '../../../src/types';
 
 let base: string;
@@ -111,6 +130,8 @@ beforeEach(() => {
   paths = mkPaths(join(base, 'ctxroot'));
   postActivitySpy.mockClear();
   telegramSendMessageSpy.mockClear();
+  rmSyncFailureQueue.length = 0;
+  execFileSyncFailOn.clear();
 });
 
 afterEach(() => {
@@ -177,6 +198,29 @@ describe('startTaskWorktree', () => {
     const branches = execFileSync('git', ['branch', '--list', 'task/demo'], { cwd: repo, encoding: 'utf-8' });
     expect(branches.trim()).toBe('');
   });
+
+  it('reports both failures distinctly when the rollback itself fails to remove the worktree AND delete the branch', () => {
+    mkdirSync(join(agentDir, '.claude'), { recursive: true });
+    writeFileSync(join(agentDir, '.claude', 'state'), 'not a directory');
+    execFileSyncFailOn.add('remove');
+    execFileSyncFailOn.add('-D');
+
+    let thrown: Error | undefined;
+    try {
+      startTaskWorktree(agentDir, repo, 'demo');
+    } catch (err: any) {
+      thrown = err;
+    }
+    expect(thrown?.message).toMatch(/worktree still exists at/);
+    expect(thrown?.message).toMatch(/branch .* still exists/);
+    expect(thrown?.message).not.toMatch(/undefined/);
+
+    // Nothing was cleaned up — matches what the message claims.
+    const worktreeRoot = join(base, '.cortextos-task-worktrees', 'repo', 'demo');
+    expect(existsSync(worktreeRoot)).toBe(true);
+    const branches = execFileSync('git', ['branch', '--list', 'task/demo'], { cwd: repo, encoding: 'utf-8' });
+    expect(branches).toContain('demo');
+  });
 });
 
 describe('finishTaskWorktree', () => {
@@ -199,6 +243,43 @@ describe('finishTaskWorktree', () => {
     expect(existsSync(statePath())).toBe(false);
     // A fresh task can be started right away — proves the agent isn't stuck.
     expect(() => startTaskWorktree(agentDir, repo, 'second-task')).not.toThrow();
+  });
+
+  it('tells the truth when a corrupted state file also cannot be removed, instead of falsely claiming cleanup happened', async () => {
+    startTaskWorktree(agentDir, repo, 'demo');
+    writeFileSync(statePath(), '{ not valid json');
+    rmSyncFailureQueue.push(Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }));
+
+    await expect(finishTaskWorktree(agentDir, paths, 'orchestrator', 'leadio', 'merge'))
+      .rejects.toThrow(/could NOT be removed.*trust window is still open/s);
+
+    // Unlike the successful-removal case, the file is still there — the
+    // thrown message's claim and reality must match, or an operator acting
+    // on the (false) "already cleaned up" message would never look for it.
+    expect(existsSync(statePath())).toBe(true);
+  });
+
+  it('reports the trust-revocation rmSync failure distinctly, not folded into a generic error', async () => {
+    startTaskWorktree(agentDir, repo, 'demo');
+    rmSyncFailureQueue.push(Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }));
+
+    await expect(finishTaskWorktree(agentDir, paths, 'orchestrator', 'leadio', 'merge'))
+      .rejects.toThrow(/Failed to revoke task-worktree trust/);
+
+    // The state file is still present — trust was genuinely NOT revoked,
+    // matching what the error says. No git operation should have run since
+    // the function must bail out at this point, before validation.
+    expect(existsSync(statePath())).toBe(true);
+  });
+
+  it('rejects a record missing startedAt, even with every other field otherwise valid', () => {
+    startTaskWorktree(agentDir, repo, 'demo');
+    const { startedAt, ...withoutStartedAt } = JSON.parse(readFileSync(statePath(), 'utf-8'));
+    expect(validateTaskWorktreeRecord(withoutStartedAt)).toBeNull();
+    expect(validateTaskWorktreeRecord({ ...withoutStartedAt, startedAt: 12345 })).toBeNull();
+    // Sanity: the same record WITH a valid startedAt does pass — isolates
+    // the failure to startedAt specifically, not some other field.
+    expect(validateTaskWorktreeRecord({ ...withoutStartedAt, startedAt })).not.toBeNull();
   });
 
   it('deletes the state file before doing anything else, closing the trust window immediately', async () => {

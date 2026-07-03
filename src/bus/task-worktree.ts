@@ -20,7 +20,15 @@ import { join, dirname, resolve } from 'path';
 import { execFileSync } from 'child_process';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { createApproval } from './approval.js';
-import { validateTaskWorktreeRecord, canonicalizePath, worktreeRootFor, type ActiveTaskWorktree } from '../hooks/index.js';
+import {
+  validateTaskWorktreeRecord,
+  canonicalizePath,
+  worktreeRootFor,
+  isValidTaskName,
+  isProtectedBranch,
+  isGitRepoRoot,
+  type ActiveTaskWorktree,
+} from '../hooks/index.js';
 import type { BusPaths } from '../types/index.js';
 
 type TaskWorktreeState = ActiveTaskWorktree;
@@ -55,18 +63,18 @@ export function startTaskWorktree(
   // otherwise a repo reached through a differently-named symlink would
   // create a worktree path the hook can never recognize as valid.
   const resolvedRepo = canonicalizePath(resolve(repo));
-  if (!existsSync(join(resolvedRepo, '.git'))) {
+  if (!isGitRepoRoot(resolvedRepo)) {
     throw new Error(`Not a git repository: ${resolvedRepo}`);
   }
   const sp = statePath(agentDir);
   if (existsSync(sp)) {
     throw new Error('A task worktree is already active for this agent. Run `task-worktree finish` first.');
   }
-  if (!/^[a-zA-Z0-9_-]+$/.test(taskName)) {
+  if (!isValidTaskName(taskName)) {
     throw new Error('Task name must contain only letters, numbers, hyphens, and underscores.');
   }
   const branchName = branch || `task/${taskName}`;
-  if (branchName === 'main' || branchName === 'master') {
+  if (isProtectedBranch(branchName)) {
     throw new Error('Refusing to use main/master as the task branch.');
   }
   const worktreeRoot = worktreeRootFor(resolvedRepo, taskName);
@@ -95,14 +103,29 @@ export function startTaskWorktree(
     };
     atomicWriteSync(sp, JSON.stringify(state, null, 2));
   } catch (err: any) {
+    // Independent try/catches — reporting which of the two actually failed
+    // matters. A combined try/catch would blame both the worktree AND the
+    // branch for manual cleanup even when only one of them survived,
+    // sending the operator chasing a "worktree remove" on a path that's
+    // already gone.
+    let removeErr: any = null;
+    let branchErr: any = null;
     try {
       execFileSync('git', ['worktree', 'remove', worktreeRoot, '--force'], { cwd: resolvedRepo, stdio: 'pipe' });
+    } catch (e: any) {
+      removeErr = e;
+    }
+    try {
       execFileSync('git', ['branch', '-D', branchName], { cwd: resolvedRepo, stdio: 'pipe' });
-    } catch (rollbackErr: any) {
+    } catch (e: any) {
+      branchErr = e;
+    }
+    if (removeErr || branchErr) {
       throw new Error(
-        `Failed to record task worktree state (${err.message || err}), AND failed to roll back the ` +
-        `worktree/branch already created at ${worktreeRoot} (${rollbackErr.message || rollbackErr}) — ` +
-        `both must be cleaned up manually.`,
+        `Failed to record task worktree state (${err.message || err}). Rollback incomplete: ` +
+        (removeErr ? `worktree still exists at ${worktreeRoot} (${removeErr.message || removeErr}); ` : 'worktree removed; ') +
+        (branchErr ? `branch ${branchName} still exists (${branchErr.message || branchErr}).` : 'branch deleted.') +
+        ' Clean up manually whatever remains.',
       );
     }
     throw new Error(`Failed to record task worktree state: ${err.message || err}`);
@@ -123,37 +146,50 @@ export async function finishTaskWorktree(
     throw new Error('No active task worktree for this agent.');
   }
 
-  // Read+parse BEFORE revoking trust (need the content to revoke it
-  // meaningfully), but if this fails (corrupted/truncated JSON, a TOCTOU
-  // race where the file vanished between the existsSync above and here),
-  // still revoke trust before throwing — otherwise a corrupted state file
-  // would leave the trust window open forever AND permanently strand the
-  // agent, since `start` refuses while this file exists and `finish` would
-  // hit this same unhandled error on every future attempt.
+  // Read+parse BEFORE revoking trust — the record's fields (repo/branch/
+  // path) are needed for the git operations below, and once the state file
+  // is gone (next block) that data is unrecoverable. But if the read/parse
+  // itself fails (corrupted/truncated JSON, a TOCTOU race where the file
+  // vanished between the existsSync above and here), still attempt to
+  // revoke trust before throwing — otherwise a corrupted state file would
+  // leave the trust window open forever AND permanently strand the agent,
+  // since `start` refuses while this file exists and `finish` would hit
+  // this same unhandled error on every future attempt.
   let rawState: any;
   try {
     rawState = JSON.parse(readFileSync(sp, 'utf-8'));
   } catch (err: any) {
+    // Track whether removal actually succeeded — the thrown message must
+    // not claim the trust window is closed if it isn't. Getting this wrong
+    // would silently reintroduce the exact stranding bug this whole branch
+    // exists to fix, just with a misleading "already cleaned up" message
+    // on top of it.
+    let removed = false;
     try {
       rmSync(sp, { force: true });
+      removed = true;
     } catch (rmErr: any) {
       console.error(`task-worktree finish: failed to remove corrupted state file ${sp}: ${rmErr.message || rmErr}`);
     }
     throw new Error(
       `Active task-worktree state file was corrupted and could not be read/parsed: ${sp}: ${err.message || err}. ` +
-      `The file has been removed so a new task can be started; if a worktree or branch still exists on disk, it must be cleaned up manually.`,
+      (removed
+        ? 'The file has been removed so a new task can be started; if a worktree or branch still exists on disk, it must be cleaned up manually.'
+        : 'The corrupted file could NOT be removed — the trust window is still open and no new task can be started until it is deleted manually (see stderr for the removal failure).'),
     );
   }
 
   // Close the trust window, before validating the record, computing diffs,
   // or touching the worktree. Once this file is gone, Bash calls in this
   // agent's session go back through the normal Telegram gate — so nothing
-  // that happens after this line (including a later `git merge`, performed
-  // as its own separately-approved step) can ride on the task's elevated
-  // trust. `force: true` only suppresses ENOENT (already-missing file); any
-  // other failure (e.g. EACCES) means the trust window is NOT actually
-  // closed, which is a security-relevant condition, not routine cleanup
-  // noise — surface it as such rather than letting a generic error through.
+  // that happens after this line can ride on the task's elevated trust,
+  // including the actual `git merge` (a manual follow-up performed by the
+  // agent per the implement-review-loop skill's Step 5 — not run by this
+  // function or anything else in this file). `force: true` only suppresses
+  // ENOENT (already-missing file); any other failure (e.g. EACCES) means
+  // the trust window is NOT actually closed, which is a security-relevant
+  // condition, not routine cleanup noise — surface it as such rather than
+  // letting a generic error through.
   try {
     rmSync(sp, { force: true });
   } catch (err: any) {
@@ -249,16 +285,16 @@ export async function finishTaskWorktree(
     return { diffStat, commits, worktreeRemoved, branchDeleted };
   }
 
-  const cleanupNote = worktreeRemoved
-    ? ''
-    : ` WARNING: the worktree checkout at ${state.path} could not be removed automatically and may still exist on disk.`;
-  const commitsText = commits === null ? 'commit count unavailable' : `${commits} commit(s)`;
   // Sanitized (not just backtick-wrapped, see sanitizeForApprovalText's doc
   // comment for why wrapping alone doesn't work) before interpolation —
   // taskName is charset-validated by validateTaskWorktreeRecord so this is
-  // defense-in-depth for it, but branch/repo have no such restriction and
-  // are read from a file an agent could in principle hand-write (see module
-  // doc above), so treat them as untrusted for display purposes too.
+  // defense-in-depth for it, but branch/repo/path have no such restriction
+  // and are read from a file an agent could in principle hand-write (see
+  // module doc above), so treat them all as untrusted for display purposes too.
+  const cleanupNote = worktreeRemoved
+    ? ''
+    : ` WARNING: the worktree checkout at ${sanitizeForApprovalText(state.path)} could not be removed automatically and may still exist on disk.`;
+  const commitsText = commits === null ? 'commit count unavailable' : `${commits} commit(s)`;
   const safeTaskName = sanitizeForApprovalText(state.taskName);
   const safeBranch = sanitizeForApprovalText(state.branch);
   const approvalTitle = `Merge task "${safeTaskName}" (${safeBranch})`;

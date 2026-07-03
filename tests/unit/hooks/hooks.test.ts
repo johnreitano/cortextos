@@ -19,6 +19,7 @@ import {
   buildAskState,
   formatQuestionMessage,
 } from '../../../src/hooks/index';
+import { startTaskWorktree } from '../../../src/bus/task-worktree';
 
 // Builds a real git repo with one commit, a real worktree created the same
 // way `cortextos bus task-worktree start` would, and a matching state file
@@ -266,6 +267,51 @@ describe('Hook Utilities', () => {
       }
     });
 
+    it('fails closed (does not throw) when the state file is corrupted, on every tool call during an active task', () => {
+      // This runs on EVERY Edit/Write/Bash call while a task is active — a
+      // regression that let this throw uncaught would crash the permission
+      // hook for every subsequent tool call, not just at `finish` time.
+      const { base, agentDir } = makeActiveTaskWorktree();
+      try {
+        writeFileSync(join(agentDir, '.claude', 'state', 'active-task-worktree.json'), '{ not valid json');
+        expect(() => isTaskWorktreeOperation('Bash', { command: 'ls' }, agentDir)).not.toThrow();
+        expect(isTaskWorktreeOperation('Bash', { command: 'ls' }, agentDir)).toBe(false);
+        expect(isTaskWorktreeOperation('Write', { file_path: '/tmp/x.txt' }, agentDir)).toBe(false);
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+
+    it('recognizes a task worktree created by the REAL startTaskWorktree, not just the hand-rolled test fixture', () => {
+      // Every other test in this describe block uses makeActiveTaskWorktree,
+      // which hand-writes the state file rather than calling the actual
+      // production writer — so it can't by itself prove worktreeRootFor is
+      // genuinely shared (not silently re-diverged) between the writer
+      // (src/bus/task-worktree.ts) and this reader.
+      const base = mkdtempSync(join(tmpdir(), 'hookperm-taskwt-real-'));
+      try {
+        const repo = join(base, 'repo');
+        mkdirSync(repo, { recursive: true });
+        execFileSync('git', ['init', '-q'], { cwd: repo });
+        execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
+        execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
+        writeFileSync(join(repo, 'README.md'), 'hello');
+        execFileSync('git', ['add', '.'], { cwd: repo });
+        execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: repo });
+
+        const agentDir = join(base, 'agent');
+        mkdirSync(agentDir, { recursive: true });
+
+        const { path: worktreePath } = startTaskWorktree(agentDir, repo, 'demo');
+
+        expect(isTaskWorktreeOperation('Bash', { command: 'ls' }, agentDir)).toBe(true);
+        expect(isTaskWorktreeOperation('Write', { file_path: join(worktreePath, 'x.ts') }, agentDir)).toBe(true);
+        expect(isTaskWorktreeOperation('Write', { file_path: join(repo, 'x.ts') }, agentDir)).toBe(false);
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+
     it('auto-approves Bash unconditionally while a task is active', () => {
       const { base, agentDir } = makeActiveTaskWorktree();
       try {
@@ -369,6 +415,21 @@ describe('Hook Utilities', () => {
         // Sanity: a genuine, non-symlinked file directly inside the worktree is still allowed.
         expect(isTaskWorktreeOperation('Write',
           { file_path: join(worktreePath, 'ok.txt') }, agentDir)).toBe(true);
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+
+    it('fails closed (refuses) when a symlink-containment check hits an unexpected lstat error, not just ENOENT', () => {
+      // A plain file where a directory is expected makes lstat on anything
+      // "inside" it fail with ENOTDIR, not ENOENT — the containment walk
+      // must NOT treat this the same as "component doesn't exist yet"
+      // (which is genuinely benign); it must fail closed instead.
+      const { base, worktreePath, agentDir } = makeActiveTaskWorktree();
+      try {
+        writeFileSync(join(worktreePath, 'not-a-dir'), 'plain file, not a directory');
+        expect(isTaskWorktreeOperation('Write',
+          { file_path: join(worktreePath, 'not-a-dir', 'nested', 'x.txt') }, agentDir)).toBe(false);
       } finally {
         rmSync(base, { recursive: true, force: true });
       }
