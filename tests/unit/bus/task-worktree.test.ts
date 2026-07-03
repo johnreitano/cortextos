@@ -160,11 +160,45 @@ describe('startTaskWorktree', () => {
     mkdirSync(clashPath, { recursive: true });
     expect(() => startTaskWorktree(agentDir, repo, 'demo')).toThrow(/already exists/);
   });
+
+  it('rolls back the worktree/branch if writing the state file fails after git worktree add succeeds', () => {
+    // A plain file where the state directory needs to be makes
+    // ensureDir(dirname(sp)) fail with ENOTDIR/EEXIST — simulating any
+    // failure between worktree creation and state-file write (disk full,
+    // permissions, etc.) without needing to mock fs.
+    mkdirSync(join(agentDir, '.claude'), { recursive: true });
+    writeFileSync(join(agentDir, '.claude', 'state'), 'not a directory');
+
+    expect(() => startTaskWorktree(agentDir, repo, 'demo')).toThrow(/Failed to record task worktree state/);
+
+    // No orphaned worktree/branch left behind — rollback ran.
+    const worktreeRoot = join(base, '.cortextos-task-worktrees', 'repo', 'demo');
+    expect(existsSync(worktreeRoot)).toBe(false);
+    const branches = execFileSync('git', ['branch', '--list', 'task/demo'], { cwd: repo, encoding: 'utf-8' });
+    expect(branches.trim()).toBe('');
+  });
 });
 
 describe('finishTaskWorktree', () => {
   it('throws when there is no active task', async () => {
     await expect(finishTaskWorktree(agentDir, paths, 'orchestrator', 'leadio', 'merge')).rejects.toThrow(/No active task/);
+  });
+
+  it('revokes trust even when the state file is corrupted, so the agent is not permanently stuck', async () => {
+    startTaskWorktree(agentDir, repo, 'demo');
+    // Corrupt it after the fact — truncated/malformed JSON, as if a crash
+    // interrupted a write despite atomicWriteSync, or the file was hand-edited.
+    writeFileSync(statePath(), '{ not valid json');
+
+    await expect(finishTaskWorktree(agentDir, paths, 'orchestrator', 'leadio', 'merge'))
+      .rejects.toThrow(/corrupted/);
+
+    // Trust window closed regardless — the whole point of the fix. Without
+    // it, this file would still exist and every subsequent start/finish
+    // call would be permanently blocked.
+    expect(existsSync(statePath())).toBe(false);
+    // A fresh task can be started right away — proves the agent isn't stuck.
+    expect(() => startTaskWorktree(agentDir, repo, 'second-task')).not.toThrow();
   });
 
   it('deletes the state file before doing anything else, closing the trust window immediately', async () => {

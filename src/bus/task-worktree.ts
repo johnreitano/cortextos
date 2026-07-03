@@ -98,15 +98,33 @@ export function startTaskWorktree(
     stdio: 'pipe',
   });
 
-  ensureDir(dirname(sp));
-  const state: TaskWorktreeState = {
-    repo: resolvedRepo,
-    path: worktreeRoot,
-    branch: branchName,
-    taskName,
-    startedAt: new Date().toISOString(),
-  };
-  atomicWriteSync(sp, JSON.stringify(state, null, 2));
+  // The worktree/branch now exist on disk with no state file yet — if
+  // anything below fails, roll the worktree back rather than leaving an
+  // orphaned, untracked worktree that getActiveTaskWorktree has no way to
+  // discover (it only ever looks for a state file, never scans disk).
+  try {
+    ensureDir(dirname(sp));
+    const state: TaskWorktreeState = {
+      repo: resolvedRepo,
+      path: worktreeRoot,
+      branch: branchName,
+      taskName,
+      startedAt: new Date().toISOString(),
+    };
+    atomicWriteSync(sp, JSON.stringify(state, null, 2));
+  } catch (err: any) {
+    try {
+      execFileSync('git', ['worktree', 'remove', worktreeRoot, '--force'], { cwd: resolvedRepo, stdio: 'pipe' });
+      execFileSync('git', ['branch', '-D', branchName], { cwd: resolvedRepo, stdio: 'pipe' });
+    } catch (rollbackErr: any) {
+      throw new Error(
+        `Failed to record task worktree state (${err.message || err}), AND failed to roll back the ` +
+        `worktree/branch already created at ${worktreeRoot} (${rollbackErr.message || rollbackErr}) — ` +
+        `both must be cleaned up manually.`,
+      );
+    }
+    throw new Error(`Failed to record task worktree state: ${err.message || err}`);
+  }
   return { path: worktreeRoot, branch: branchName };
 }
 
@@ -122,18 +140,38 @@ export async function finishTaskWorktree(
   if (!existsSync(sp)) {
     throw new Error('No active task worktree for this agent.');
   }
-  const rawState = JSON.parse(readFileSync(sp, 'utf-8'));
 
-  // Close the trust window FIRST, before validating the record, computing
-  // diffs, or touching the worktree. Once this file is gone, Bash calls in
-  // this agent's session go back through the normal Telegram gate — so
-  // nothing that happens after this line (including a later `git merge`,
-  // performed as its own separately-approved step) can ride on the task's
-  // elevated trust. `force: true` only suppresses ENOENT (already-missing
-  // file); any other failure (e.g. EACCES) means the trust window is NOT
-  // actually closed, which is a security-relevant condition, not routine
-  // cleanup noise — surface it as such rather than letting a generic error
-  // through.
+  // Read+parse BEFORE revoking trust (need the content to revoke it
+  // meaningfully), but if this fails (corrupted/truncated JSON, a TOCTOU
+  // race where the file vanished between the existsSync above and here),
+  // still revoke trust before throwing — otherwise a corrupted state file
+  // would leave the trust window open forever AND permanently strand the
+  // agent, since `start` refuses while this file exists and `finish` would
+  // hit this same unhandled error on every future attempt.
+  let rawState: any;
+  try {
+    rawState = JSON.parse(readFileSync(sp, 'utf-8'));
+  } catch (err: any) {
+    try {
+      rmSync(sp, { force: true });
+    } catch (rmErr: any) {
+      console.error(`task-worktree finish: failed to remove corrupted state file ${sp}: ${rmErr.message || rmErr}`);
+    }
+    throw new Error(
+      `Active task-worktree state file was corrupted and could not be read/parsed: ${sp}: ${err.message || err}. ` +
+      `The file has been removed so a new task can be started; if a worktree or branch still exists on disk, it must be cleaned up manually.`,
+    );
+  }
+
+  // Close the trust window, before validating the record, computing diffs,
+  // or touching the worktree. Once this file is gone, Bash calls in this
+  // agent's session go back through the normal Telegram gate — so nothing
+  // that happens after this line (including a later `git merge`, performed
+  // as its own separately-approved step) can ride on the task's elevated
+  // trust. `force: true` only suppresses ENOENT (already-missing file); any
+  // other failure (e.g. EACCES) means the trust window is NOT actually
+  // closed, which is a security-relevant condition, not routine cleanup
+  // noise — surface it as such rather than letting a generic error through.
   try {
     rmSync(sp, { force: true });
   } catch (err: any) {
