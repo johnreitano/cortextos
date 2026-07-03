@@ -95,9 +95,13 @@ export function startTaskWorktree(
   // Fail CLOSED on an ambiguous result. `git rev-parse --verify --quiet`
   // exits 1 (and ONLY 1) to mean "this ref genuinely does not exist" — that
   // is the sole result we may safely read as "absent." Any other failure
-  // (exit 128 on a corrupt/unreadable ref, ENOENT if git is missing, or a
-  // thrown timeout/spawn error with no numeric status) means the check
-  // could not determine existence. Treating those as "absent" would be the
+  // (exit 128 when `resolvedRepo` isn't a readable git repository, ENOENT if
+  // git is missing, or a thrown timeout/spawn error with no numeric status)
+  // means the check could not determine existence. (Note: a corrupt/broken
+  // loose ref is NOT one of these — git exits 1 with a "broken ref" warning,
+  // so it reads as "absent"; the rollback re-check below uses the same
+  // status===1 logic, so it too treats a broken ref as absent and never
+  // force-deletes it.) Treating an ambiguous result as "absent" would be the
   // same over-broad-signal bug this whole block exists to kill, one layer
   // up: a false "absent" skips the guard below, `git worktree add` then
   // fails because the branch really does exist, and the rollback path force-
@@ -142,13 +146,14 @@ export function startTaskWorktree(
   } catch (err: any) {
     const stderr = err.stderr?.toString?.() || err.message || String(err);
     // We already confirmed above that `branchName` did not exist before
-    // this call, so any failure here (e.g. the destination directory
-    // already existing and being non-empty) that leaves the branch present
-    // is unambiguously an orphan git created as a side effect before
-    // validating the destination — verified empirically, this isn't
-    // speculative. No stderr text matching needed to know it's safe to
-    // delete: existence alone is proof, since it couldn't have existed
-    // beforehand.
+    // this call, so any failure here that leaves the branch present is
+    // unambiguously an orphan git created as a side effect before validating
+    // the destination — verified empirically, this isn't speculative. (One
+    // way to reach this: the destination gets created between our
+    // existSync(worktreeRoot) guard at the top and this call — a TOCTOU race
+    // — so worktree add fails on the destination yet still leaves the branch
+    // behind.) No stderr text matching needed to know it's safe to delete:
+    // existence alone is proof, since it couldn't have existed beforehand.
     let branchNowExists = false;
     try {
       execFileSync('git', ['rev-parse', '--verify', '--quiet', `refs/heads/${branchName}`], {
