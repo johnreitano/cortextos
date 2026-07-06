@@ -13,6 +13,7 @@ import { createExperiment, runExperiment, evaluateExperiment, listExperiments, g
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
+import { startTaskWorktree, finishTaskWorktree } from '../bus/task-worktree.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
@@ -1131,6 +1132,55 @@ busCommand
     updateApproval(paths, id, status as ApprovalStatus, note);
     console.log(`Approval ${id} -> ${status}`);
   });
+
+busCommand
+  .command('task-worktree')
+  .description('Manage an isolated, auto-approved task worktree for autonomous implement/review-loop work')
+  .addCommand(
+    new Command('start')
+      .description('Create a task worktree and grant it tool-call trust (see src/hooks/index.ts)')
+      .argument('<task-name>', 'Short, filesystem-safe task identifier (letters, numbers, hyphens, underscores)')
+      .requiredOption('--repo <path>', 'Path to the git repository to work in')
+      .option('--branch <name>', 'Branch name (default: task/<task-name>)')
+      .action((taskName: string, options: { repo: string; branch?: string }) => {
+        const env = resolveEnv();
+        const agentDir = env.agentDir || process.cwd();
+        try {
+          const result = startTaskWorktree(agentDir, options.repo, taskName, options.branch);
+          console.log(`Task worktree ready: ${result.path} (branch: ${result.branch})`);
+        } catch (err: any) {
+          console.error(`Failed to start task worktree: ${err.message || err}`);
+          process.exit(1);
+        }
+      }),
+  )
+  .addCommand(
+    new Command('finish')
+      .description('Close the active task worktree, revoking its tool-call trust, and request merge approval')
+      .option('--abandon', 'Discard the branch instead of requesting a merge approval')
+      .action(async (options: { abandon?: boolean }) => {
+        const env = resolveEnv();
+        const agentDir = env.agentDir || process.cwd();
+        const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+        try {
+          const result = await finishTaskWorktree(
+            agentDir, paths, env.agentName, env.org, options.abandon ? 'abandon' : 'merge', env.frameworkRoot,
+          );
+          const status = result.worktreeRemoved
+            ? 'Task worktree closed.'
+            : 'Task worktree trust revoked, but the on-disk worktree could not be removed automatically — remove it manually with `git worktree remove --force`.';
+          const commitsText = result.commits === null ? 'commit count unavailable' : `${result.commits} commit(s)`;
+          console.log(`${status} ${commitsText}, ${result.diffStat}.`);
+          if (result.branchDeleted === false) {
+            console.log('WARNING: the task branch could not be deleted — remove it manually with `git branch -D`.');
+          }
+          if (result.approvalId) console.log(`Approval requested: ${result.approvalId}`);
+        } catch (err: any) {
+          console.error(`Failed to finish task worktree: ${err.message || err}`);
+          process.exit(1);
+        }
+      }),
+  );
 
 // ---------------------------------------------------------------------------
 // Knowledge Base commands

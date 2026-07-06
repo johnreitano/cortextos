@@ -7,6 +7,7 @@ import { readFileSync, existsSync, watch, statSync, unlinkSync, mkdirSync, realp
 import { join, resolve, sep, dirname, basename } from 'path';
 import { homedir } from 'os';
 import * as crypto from 'crypto';
+import { execFileSync } from 'child_process';
 
 /**
  * Read all data from stdin as a string.
@@ -269,8 +270,16 @@ export function isClaudeDirOperation(
 /**
  * Whether any path component strictly below `rootDir` (assumed already
  * canonical) up to and including `target` is a symlink (live or dangling).
- * Stops at the first non-existent component — a name that doesn't exist yet
- * cannot be a symlink, and deeper components can't exist under it.
+ * Stops at the first non-existent component (ENOENT) — a name that doesn't
+ * exist yet cannot be a symlink, and deeper components can't exist under it.
+ *
+ * Any OTHER lstat failure (EACCES, ENOTDIR, ELOOP — an actual symlink loop,
+ * the exact hazard this function exists to catch) is NOT treated as
+ * "benign, keep going": it fails closed by returning true, so the caller
+ * treats the path as untrusted rather than silently reporting "no symlink
+ * found" when the check genuinely couldn't be completed. This matters more
+ * now than when the function was first written, since it backs both
+ * `.claude/` containment AND the task-worktree trust grant.
  */
 function hasSymlinkComponent(rootDir: string, target: string): boolean {
   if (!target.startsWith(rootDir + sep)) return false;
@@ -280,8 +289,10 @@ function hasSymlinkComponent(rootDir: string, target: string): boolean {
     cur = join(cur, part);
     try {
       if (lstatSync(cur).isSymbolicLink()) return true;
-    } catch {
-      break;
+    } catch (err: any) {
+      if (err.code === 'ENOENT') break;
+      console.error(`hasSymlinkComponent: unexpected error stat'ing ${cur}: ${err.message || err}`);
+      return true;
     }
   }
   return false;
@@ -292,21 +303,292 @@ function hasSymlinkComponent(rootDir: string, target: string): boolean {
  * exist yet (e.g. a Write that creates a new file), we realpath the deepest
  * existing ancestor — which resolves any symlinked component — then re-append
  * the non-existent tail. Falls back to the lexical path if nothing exists.
+ *
+ * ENOENT (component doesn't exist yet) is the only error treated as "keep
+ * climbing toward an ancestor that does exist" — that's the genuinely benign
+ * case this function is designed around. Any other realpathSync failure
+ * (EACCES, ELOOP — an actual symlink loop, ENOTDIR) is NOT safe to treat the
+ * same way: continuing to climb past one could produce a "resolved" path
+ * that doesn't actually reflect where a loop redirects, or paper over a
+ * permissions problem. This function backs the containment checks in
+ * isClaudeDirOperation/isTaskWorktreeOperation and the repo/path validation
+ * in validateTaskWorktreeRecord, so a wrong answer here doesn't just affect
+ * display — it can make an equality/prefix check pass or fail incorrectly.
+ * On any non-ENOENT error, log it and fall back to the raw lexical path
+ * immediately (not the deepest-resolved-ancestor logic) — callers' own
+ * checks then compare against an unresolved value, which fails closed
+ * (denies trust) rather than risk approving based on a wrong resolution.
  */
-function canonicalizePath(p: string): string {
+export function canonicalizePath(p: string): string {
   let dir = p;
   const tail: string[] = [];
   for (;;) {
     try {
       const real = realpathSync(dir);
       return tail.length ? resolve(real, ...tail.reverse()) : real;
-    } catch {
+    } catch (err: any) {
+      if (err.code !== 'ENOENT') {
+        console.error(`canonicalizePath: unexpected error resolving ${dir}: ${err.message || err}`);
+        return p;
+      }
       const parent = dirname(dir);
       if (parent === dir) return p; // reached fs root, nothing on the path exists
       tail.push(basename(dir));
       dir = parent;
     }
   }
+}
+
+export interface ActiveTaskWorktree {
+  readonly path: string;
+  readonly branch: string;
+  readonly repo: string;
+  readonly taskName: string;
+  readonly startedAt: string;
+}
+
+/**
+ * Fixed, repo-derived worktree location for a task — the ONE formula both
+ * the writer (`startTaskWorktree`, src/bus/task-worktree.ts) and the reader
+ * (`validateTaskWorktreeRecord` below) use, so the taskName<->path
+ * invariant can't silently drift by editing one copy and not the other.
+ * `resolvedRepo` must already be canonicalized by the caller. Only the
+ * final path segment (`taskName`) is agent-supplied, and it must already
+ * have passed `isValidTaskName` before reaching here — this function does
+ * not re-validate it.
+ */
+export function worktreeRootFor(resolvedRepo: string, taskName: string): string {
+  return join(dirname(resolvedRepo), '.cortextos-task-worktrees', basename(resolvedRepo), taskName);
+}
+
+/**
+ * The one taskName charset check, shared by `startTaskWorktree` (write time)
+ * and `validateTaskWorktreeRecord` (read time) — previously hand-duplicated
+ * as an identical regex literal in both files, the same drift risk
+ * `worktreeRootFor` exists to avoid for the path formula.
+ */
+export function isValidTaskName(taskName: string): boolean {
+  return /^[a-zA-Z0-9_-]+$/.test(taskName);
+}
+
+/** Shared main/master blocklist — see the callers for why this check exists. */
+export function isProtectedBranch(branch: string): boolean {
+  return branch === 'main' || branch === 'master';
+}
+
+/**
+ * Shared "is this actually a git repository" check (not just some cwd
+ * `git worktree list` happens to accept). Note: this only checks that
+ * `.git` exists, not its shape — a git worktree or submodule checkout also
+ * has a `.git` (as a file, not a directory) and passes this too, so it
+ * doesn't by itself guarantee `resolvedRepo` is the primary/top-level
+ * checkout. That laxity is harmless at both call sites, for different
+ * reasons: at write time (`startTaskWorktree`) this only guards against an
+ * obviously-bogus `--repo` — a worktree/submodule checkout there is fine
+ * since `git worktree add` works correctly from inside one. At read time
+ * (`validateTaskWorktreeRecord`) the subsequent `git worktree list`
+ * cross-check against the record's `path`/`branch` closes the gap this
+ * laxity would otherwise leave.
+ */
+export function isGitRepoRoot(resolvedRepo: string): boolean {
+  return existsSync(join(resolvedRepo, '.git'));
+}
+
+/**
+ * Validate an already-parsed task-worktree record. Returns null if:
+ * - it's malformed (missing/wrong-typed field, including `startedAt`)
+ * - its `taskName` contains characters outside `[a-zA-Z0-9_-]`
+ * - it names main/master as its branch
+ * - its `repo` isn't a git repository root
+ * - `git worktree list` can't be run against `repo` (operational failure)
+ * - its `path` doesn't match the expected location for its own `taskName`
+ *   (see `worktreeRootFor`)
+ * - that path isn't currently a registered worktree at all
+ * - that worktree is detached (no branch checked out)
+ * - its `branch` doesn't match the branch actually checked out at that path
+ *
+ * This is the ONE validator used on every read of
+ * `.claude/state/active-task-worktree.json`, by both the permission hook
+ * (`getActiveTaskWorktree` below) and `finishTaskWorktree`
+ * (src/bus/task-worktree.ts). It exists because, although
+ * `cortextos bus task-worktree start` is the only code path INTENDED to
+ * write this file, nothing stops an agent from writing it directly — it
+ * lives inside the already-trusted `.claude/` tree. Validating a record
+ * in one reader but not the other would leave the unvalidated reader
+ * trusting an agent-supplied path/branch/repo outright; sharing this
+ * function is what closes that gap for both.
+ *
+ * Every field that can be cross-referenced against reality IS
+ * cross-referenced, deliberately: verifying `path` alone isn't enough,
+ * because a record could keep a real, previously-verified `path` but swap
+ * in an unrelated `branch` — e.g. to make `finishTaskWorktree`'s
+ * `git branch -D` on the abandon path force-delete an arbitrary branch
+ * that has nothing to do with the sanctioned worktree — or an unrelated
+ * `taskName`, misleading whoever reads it in the human-facing
+ * merge-approval text about what's actually being merged. `path` is
+ * required to be the EXACT location `worktreeRootFor` would derive for
+ * `record.taskName`, and `branch` is required to equal what
+ * `git worktree list` reports for that exact path.
+ *
+ * Every rejection is logged (stderr — stdout is reserved for the hook's
+ * JSON decision protocol) so a legitimate operational failure (git
+ * timeout, lock file, corrupted repo) isn't indistinguishable from an
+ * actual tampered record when someone's troubleshooting `finish`. Trust
+ * is fail-closed either way; logging the reason costs nothing security-wise.
+ *
+ * `startedAt` is currently informational only — nothing reads it for a
+ * security decision or staleness/expiry check — but it's still type-checked
+ * here rather than left to bypass validation like the other fields, since
+ * a "validated record" should mean every one of its fields was actually
+ * checked, not "every field except this one, trust it on faith."
+ */
+export function validateTaskWorktreeRecord(record: any): ActiveTaskWorktree | null {
+  if (
+    !record ||
+    typeof record.path !== 'string' ||
+    typeof record.repo !== 'string' ||
+    typeof record.branch !== 'string' ||
+    typeof record.taskName !== 'string' ||
+    typeof record.startedAt !== 'string'
+  ) {
+    console.error('task-worktree: rejecting record — missing or wrong-typed field(s)');
+    return null;
+  }
+  // Applied here (not just at startTaskWorktree's write time) because
+  // taskName is otherwise never cross-checked against anything (unlike
+  // path/branch/repo), and it's interpolated into a human-facing Telegram
+  // approval message. Restricting it to letters/numbers/hyphens/underscores
+  // rules out Markdown control characters (backticks, brackets, parens,
+  // asterisks) at the source, rather than trying to escape them at every
+  // display site.
+  if (!isValidTaskName(record.taskName)) {
+    console.error('task-worktree: rejecting record — taskName contains disallowed characters');
+    return null;
+  }
+  // Independently of the path/branch cross-check below: never grant
+  // task-worktree trust to a record naming main/master as its branch, even
+  // if some future change loosens the other checks — editing/Bash-ing
+  // against the repo's mainline branch must never ride on this trust grant.
+  if (isProtectedBranch(record.branch)) {
+    console.error(`task-worktree: rejecting record — branch is ${record.branch}`);
+    return null;
+  }
+
+  const canonRepo = canonicalizePath(resolve(record.repo));
+  if (!isGitRepoRoot(canonRepo)) {
+    console.error(`task-worktree: rejecting record — repo is not a git repository root: ${canonRepo}`);
+    return null;
+  }
+  // Pinned to taskName, not just the repo's task-worktrees root — otherwise
+  // a record could pair a real, legitimately-registered worktree's path
+  // with an unrelated taskName, misleading whoever reads the taskName in
+  // the human-facing merge-approval text about what's actually being
+  // merged. Uses the SAME worktreeRootFor the writer uses (not a hand-
+  // mirrored copy of its formula) so the invariant can't silently drift.
+  const expectedPath = worktreeRootFor(canonRepo, record.taskName);
+  const canonPath = canonicalizePath(resolve(record.path));
+  if (canonPath !== expectedPath) {
+    console.error(`task-worktree: rejecting record — path does not match the expected location for taskName "${record.taskName}"`);
+    return null;
+  }
+
+  let foundPath = false;
+  let actualBranch: string | null = null;
+  try {
+    const list = execFileSync('git', ['worktree', 'list', '--porcelain'], {
+      cwd: canonRepo, encoding: 'utf-8', timeout: 10000,
+    });
+    for (const block of list.split('\n\n')) {
+      const pathMatch = block.match(/^worktree (.+)$/m);
+      if (!pathMatch || canonicalizePath(resolve(pathMatch[1])) !== canonPath) continue;
+      foundPath = true;
+      const branchMatch = block.match(/^branch refs\/heads\/(.+)$/m);
+      actualBranch = branchMatch ? branchMatch[1] : null;
+      break;
+    }
+  } catch (err: any) {
+    console.error(`task-worktree: rejecting record — failed to run git worktree list: ${err.message || err}`);
+    return null;
+  }
+  // "Not registered at all" and "registered but detached" are distinct
+  // failure classes with different causes (stale/fabricated record vs.
+  // something manually checking out a commit inside a live worktree) —
+  // logged separately so troubleshooting `finish` doesn't have to guess
+  // which one happened.
+  if (!foundPath) {
+    console.error(`task-worktree: rejecting record — path is not a currently registered git worktree of ${canonRepo}`);
+    return null;
+  }
+  if (actualBranch === null) {
+    console.error(`task-worktree: rejecting record — path is a registered worktree of ${canonRepo} but is detached (no branch checked out)`);
+    return null;
+  }
+  if (actualBranch !== record.branch) {
+    console.error(
+      `task-worktree: rejecting record — branch mismatch: record says "${record.branch}", the worktree is actually on "${actualBranch}"`,
+    );
+    return null;
+  }
+
+  return { path: canonPath, branch: actualBranch, repo: canonRepo, taskName: record.taskName, startedAt: record.startedAt };
+}
+
+/**
+ * Read and validate the active task-worktree record for an agent, if any.
+ * Returns null if there is no active task, the file can't be read/parsed,
+ * or the record fails any of `validateTaskWorktreeRecord`'s checks — see
+ * that function's docstring for the full enumerated list.
+ */
+export function getActiveTaskWorktree(agentDir: string): ActiveTaskWorktree | null {
+  const statePath = join(agentDir, '.claude', 'state', 'active-task-worktree.json');
+  if (!existsSync(statePath)) return null;
+
+  let record: any;
+  try {
+    record = JSON.parse(readFileSync(statePath, 'utf-8'));
+  } catch (err: any) {
+    console.error(`task-worktree: rejecting record — failed to read/parse ${statePath}: ${err.message || err}`);
+    return null;
+  }
+  return validateTaskWorktreeRecord(record);
+}
+
+/**
+ * Whether a tool call is confined to the agent's currently active, verified
+ * task worktree (see `cortextos bus task-worktree start`/`finish`).
+ *
+ * Edit/Write are checked for path containment exactly like
+ * isClaudeDirOperation. Bash is NOT — Claude Code's Bash tool carries no
+ * per-call working directory, and this hook runs as a stateless subprocess
+ * per call, so there's no reliable signal to confine a shell command to the
+ * worktree. A scoped/allowlisted Bash was considered and rejected: neither
+ * a cwd check (no signal to check) nor a command allowlist (defeatable by
+ * shell metacharacters) can actually enforce containment, so while a task is
+ * active, Bash is trusted unconditionally — a deliberate, wider trust grant
+ * accepted for the task's duration. Calling `task-worktree finish` reads
+ * the record it needs, then deletes the state file before validating the
+ * record, computing diffs, or touching the worktree — so a subsequent
+ * merge/deploy step always goes through the normal Telegram gate.
+ */
+export function isTaskWorktreeOperation(
+  toolName: string,
+  toolInput: any,
+  agentDir?: string,
+): boolean {
+  const base = agentDir ?? process.env.CTX_AGENT_DIR;
+  if (!base) return false;
+  const active = getActiveTaskWorktree(resolve(base));
+  if (!active) return false;
+
+  if (toolName === 'Bash') return true;
+
+  if (toolName !== 'Edit' && toolName !== 'Write') return false;
+  const filePath = toolInput?.file_path;
+  if (typeof filePath !== 'string' || filePath.length === 0) return false;
+
+  const target = canonicalizePath(resolve(active.path, filePath));
+  if (target !== active.path && !target.startsWith(active.path + sep)) return false;
+  return !hasSymlinkComponent(active.path, target);
 }
 
 /**
