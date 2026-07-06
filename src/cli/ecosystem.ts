@@ -95,8 +95,15 @@ export const ecosystemCommand = new Command('ecosystem')
     // dashboard/node_modules/next/dist/bin/next and is just a Node script,
     // so PM2 spawns it cleanly regardless of platform or npm shim.
     const nextBin = join(dashboardDir, 'node_modules', 'next', 'dist', 'bin', 'next');
+    // Prefer the production server when a build exists (.next/BUILD_ID is
+    // only written by `next build`). `next dev` relies on HMR/streaming
+    // connections that stall behind Cloudflare tunnels, leaving pages
+    // permanently un-hydrated — the login button stuck on "Loading…".
+    // Fall back to dev mode so fresh installs without a build still boot.
+    const hasProdBuild = existsSync(join(dashboardDir, '.next', 'BUILD_ID'));
+    const nextMode = hasProdBuild ? 'start' : 'dev';
     const dashboardScript = existsSync(nextBin) ? nextBin : 'npm';
-    const dashboardArgs = existsSync(nextBin) ? 'dev' : 'run dev';
+    const dashboardArgs = existsSync(nextBin) ? nextMode : `run ${nextMode}`;
 
     // windowsHide: stops PM2 from attaching a visible "next-server" console
     // window to the dashboard process at boot on Windows. PM2's default
