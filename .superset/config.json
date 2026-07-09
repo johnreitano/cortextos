@@ -1,0 +1,14 @@
+{
+  "setup": [
+    "#!/usr/bin/env sh",
+    "set -e",
+    "# 1. Secrets (gitignored, absent in fresh worktrees)",
+    "if [ ! -f .dev.vars ]; then",
+    "cp \"${SUPERSET_ROOT_PATH}/.env\" ./",
+    "fi",
+    "# 2. Dependencies (worktrees don't share node_modules)",
+    "npm ci"
+  ],
+  "teardown": [],
+  "run": []
+}
