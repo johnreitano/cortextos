@@ -288,7 +288,7 @@ Semantic vector store. Three collections: `agent-{agent}` (auto-reindexed at hea
 
 ```bash
 # Re-index memory at heartbeat
-cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md \
+cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md ./experiments/learnings.md \
   --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private --force
 
 # Query before any task

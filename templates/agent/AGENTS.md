@@ -329,7 +329,7 @@ The knowledge base is a semantic vector store (ChromaDB, Gemini Embedding 2). Th
 **agent-{agent} is automatic.** On every heartbeat cycle, re-ingest your memory files so they stay current and searchable:
 ```bash
 # Run on every heartbeat
-cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md \
+cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md ./experiments/learnings.md \
   --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private --force
 ```
 
