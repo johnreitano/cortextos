@@ -93,6 +93,26 @@ If you learned something this cycle that should persist across sessions:
 - System behaviors noted
 - Append to MEMORY.md
 
+## Step 9: Re-ingest memory to knowledge base
+
+Keep your memory collection searchable and current — without this step, your
+daily memory and MEMORY.md never reach the KB and your work is unsearchable:
+
+```bash
+# Today's memory file does not exist until today's first write, so on a fresh
+# UTC day this ingest would otherwise name a file it does not have. Create the
+# paths first: an empty file ingests as SKIP (empty), a missing one is an error.
+mkdir -p ./memory ./experiments
+touch ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md ./experiments/learnings.md
+
+cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md ./experiments/learnings.md \
+  --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private --force
+```
+
+The collection is derived from `--agent` + `--scope` (`agent-<name>`); there is
+no `--collection` flag. This runs every heartbeat so past findings stay
+semantically searchable. Skip only if GEMINI_API_KEY is not configured.
+
 ---
 
 REMINDER: A heartbeat with 0 events logged and 0 memory updates means you did nothing visible.

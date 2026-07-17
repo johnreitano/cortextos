@@ -18,7 +18,7 @@ import { createReminder, listReminders, ackReminder, pruneReminders } from '../b
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
 import { nextFireFromCron } from '../daemon/cron-scheduler.js';
-import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
+import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs, KBIngestIncompleteError } from '../bus/knowledge-base.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv, resolveTargetAgentDir } from '../utils/env.js';
@@ -1186,6 +1186,25 @@ busCommand
 // Knowledge Base commands
 // ---------------------------------------------------------------------------
 
+// Guard for --collection, which was documented across many agent files but never
+// existed on this CLI (git history has no trace of it). Rather than let commander
+// emit a bare "unknown option", we accept the flag and refuse with a message that
+// hands over the correct form — so an agent (or a doc) that still passes it
+// self-corrects instantly instead of hunting for a version where it worked. The
+// refusal is deliberate: a hard failure is the only signal that surfaces the bad
+// doc; the daily memory it guards is on disk and re-ingests on the next --force
+// run, so a refused cycle is recoverable, not lost.
+function kbCollectionRemoved(): void {
+  console.error(
+    'ERROR: --collection is not a valid flag (it never existed on this CLI).\n' +
+    '  The collection is DERIVED from --agent + --scope:\n' +
+    '    --scope private --agent <name>  → agent-<name>\n' +
+    '    --scope shared  --org <org>     → shared-<org>\n' +
+    '  Re-run without --collection.',
+  );
+  process.exit(1);
+}
+
 busCommand
   .command('kb-query')
   .description('Query the knowledge base (RAG search)')
@@ -1195,8 +1214,10 @@ busCommand
   .option('--scope <s>', 'Scope: shared, private, or all', 'all')
   .option('--top-k <n>', 'Number of results', '5')
   .option('--threshold <f>', 'Minimum similarity score (0-1)', '0.5')
+  .option('--collection <name>', 'Removed — collection is derived from --agent + --scope')
   .option('--json', 'Output raw JSON')
-  .action((question: string, opts: { org?: string; agent?: string; scope?: string; topK?: string; threshold?: string; json?: boolean }) => {
+  .action((question: string, opts: { org?: string; agent?: string; scope?: string; topK?: string; threshold?: string; collection?: string; json?: boolean }) => {
+    if (opts.collection !== undefined) { kbCollectionRemoved(); return; }
     const env = resolveEnv();
     const org = opts.org || env.org;
     if (!org) {
@@ -1244,8 +1265,10 @@ busCommand
   .option('--org <org>', 'Organization name')
   .option('--agent <name>', 'Agent name (for private scope)')
   .option('--scope <s>', 'Scope: shared or private', 'shared')
+  .option('--collection <name>', 'Removed — collection is derived from --agent + --scope')
   .option('--force', 'Re-ingest even if already indexed')
-  .action((paths: string[], opts: { org?: string; agent?: string; scope?: string; force?: boolean }) => {
+  .action((paths: string[], opts: { org?: string; agent?: string; scope?: string; collection?: string; force?: boolean }) => {
+    if (opts.collection !== undefined) { kbCollectionRemoved(); return; }
     const env = resolveEnv();
     const org = opts.org || env.org;
     if (!org) {
@@ -1255,14 +1278,22 @@ busCommand
 
     ensureKBDirs(env.instanceId, env.frameworkRoot, org);
 
-    ingestKnowledgeBase(paths, {
-      org,
-      agent: opts.agent || env.agentName,
-      scope: (opts.scope as 'shared' | 'private') || 'shared',
-      force: opts.force,
-      frameworkRoot: env.frameworkRoot || process.cwd(),
-      instanceId: env.instanceId,
-    });
+    try {
+      ingestKnowledgeBase(paths, {
+        org,
+        agent: opts.agent || env.agentName,
+        scope: (opts.scope as 'shared' | 'private') || 'shared',
+        force: opts.force,
+        frameworkRoot: env.frameworkRoot || process.cwd(),
+        instanceId: env.instanceId,
+      });
+    } catch (err) {
+      if (err instanceof KBIngestIncompleteError) {
+        console.error(err.message);
+        process.exit(1);
+      }
+      throw err;
+    }
   });
 
 busCommand

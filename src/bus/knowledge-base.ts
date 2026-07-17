@@ -239,6 +239,18 @@ export function queryKnowledgeBase(
 }
 
 /**
+ * Raised when mmrag ran but could not ingest every named source. The
+ * per-source detail is already on stdout by then, so callers should print
+ * `message` alone and exit non-zero rather than dump a stack trace.
+ */
+export class KBIngestIncompleteError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'KBIngestIncompleteError';
+  }
+}
+
+/**
  * Ingest files into the knowledge base.
  */
 export function ingestKnowledgeBase(
@@ -316,12 +328,27 @@ export function ingestKnowledgeBase(
       : KB_INGEST_TIMEOUT_DEFAULT_MS,
   );
 
-  execFileSync(pythonPath, args, {
-    encoding: 'utf-8',
-    timeout: ingestTimeoutMs,
-    env,
-    stdio: 'inherit',
-  });
+  try {
+    execFileSync(pythonPath, args, {
+      encoding: 'utf-8',
+      timeout: ingestTimeoutMs,
+      env,
+      stdio: 'inherit',
+    });
+  } catch (err) {
+    // mmrag exits non-zero when a named source was NOT FOUND or failed to
+    // ingest, and it has already printed the per-source detail to the inherited
+    // stdio. Rethrowing the raw execFileSync error would bury that report under
+    // a stack trace, so surface a summary line and let the caller exit non-zero.
+    const status = (err as { status?: number }).status;
+    if (typeof status === 'number') {
+      throw new KBIngestIncompleteError(
+        `kb-ingest failed: could not ingest every named source into collection ` +
+        `'${collection}' — see the NOT FOUND / Errors detail above.`,
+      );
+    }
+    throw err;
+  }
 
   console.log(`\nIngest complete → collection: ${collection}`);
 }

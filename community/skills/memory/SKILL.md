@@ -105,8 +105,8 @@ Update at every heartbeat and session end. Ingest to KB after updating.
 
 Re-ingest MEMORY.md and today's daily memory on every heartbeat so they stay semantically searchable:
 ```bash
-cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md \
-  --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private --collection memory-$CTX_AGENT_NAME --force
+cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md ./experiments/learnings.md \
+  --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private --force
 ```
 
 ---
