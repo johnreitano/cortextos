@@ -37,7 +37,7 @@ vi.mock('../../../src/utils/org.js', () => ({
   normalizeOrgName: (_root: string, org: string) => org,
 }));
 
-const { queryKnowledgeBase, ingestKnowledgeBase } = await import('../../../src/bus/knowledge-base.js');
+const { queryKnowledgeBase, ingestKnowledgeBase, KBIngestIncompleteError } = await import('../../../src/bus/knowledge-base.js');
 
 // Minimal BusPaths stub — knowledge-base.ts doesn't actually USE the paths
 // object at call time, just the options/env it constructs.
@@ -140,6 +140,77 @@ describe('ingestKnowledgeBase — graceful missing-config', () => {
     expect(argv).toEqual(expect.arrayContaining(['ingest', '/some/file.md']));
     // Happy path emits no [kb] warning.
     expect(warnLog.filter((m) => m.includes('[kb]'))).toHaveLength(0);
+  });
+});
+
+describe('ingestKnowledgeBase — an incomplete ingest is not a success', () => {
+  /** Simulate execFileSync's behaviour when the child exits non-zero. */
+  function mockChildExit(status: number): void {
+    execFileSyncMock.mockImplementation(() => {
+      const err = new Error('Command failed') as Error & { status?: number };
+      err.status = status;
+      throw err;
+    });
+  }
+
+  it('mmrag exiting non-zero (NOT FOUND / errors) throws KBIngestIncompleteError', () => {
+    mockConfiguredKb();
+    mockChildExit(1);
+
+    // The whole point of the fix: a named source the KB never got must not be
+    // reportable as success. Silence here is how an agent's collection rots.
+    expect(() =>
+      ingestKnowledgeBase(['/gone.md'], baseOptions),
+    ).toThrow(KBIngestIncompleteError);
+  });
+
+  it('the failure names the collection and points at the detail already printed', () => {
+    mockConfiguredKb();
+    mockChildExit(1);
+
+    try {
+      ingestKnowledgeBase(['/gone.md'], baseOptions);
+      throw new Error('expected ingestKnowledgeBase to throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(KBIngestIncompleteError);
+      const msg = (err as Error).message;
+      expect(msg).toMatch(/NOT FOUND/);
+      // mmrag already wrote the per-source report to the inherited stdio, so
+      // the wrapper must not restate it as a stack trace.
+      expect(msg).not.toMatch(/Command failed/);
+    }
+  });
+
+  it('never claims "Ingest complete" when the ingest was incomplete', () => {
+    mockConfiguredKb();
+    mockChildExit(1);
+
+    expect(() => ingestKnowledgeBase(['/gone.md'], baseOptions)).toThrow();
+
+    // The original bug was exactly this contradiction: NOT FOUND in the body,
+    // "complete" in the summary, exit 0 agreeing with the summary.
+    expect(logLog.some((m) => /Ingest complete/i.test(m))).toBe(false);
+  });
+
+  it('a spawn failure (no exit status) propagates unchanged, not mislabelled', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockImplementation(() => {
+      // e.g. ENOENT on the python binary — no `status`, a different fault class.
+      throw new Error('spawn ENOENT');
+    });
+
+    expect(() => ingestKnowledgeBase(['/f.md'], baseOptions)).toThrow(/spawn ENOENT/);
+    expect(() => ingestKnowledgeBase(['/f.md'], baseOptions)).not.toThrow(KBIngestIncompleteError);
+  });
+
+  it('a clean run still reports completion and does not throw', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('');
+
+    // Guards the fleet-critical happy path: every heartbeat ingest depends on
+    // an all-sources-present run staying quiet and exit-0.
+    expect(() => ingestKnowledgeBase(['/f.md'], baseOptions)).not.toThrow();
+    expect(logLog.some((m) => /Ingest complete/i.test(m))).toBe(true);
   });
 });
 

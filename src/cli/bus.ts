@@ -18,7 +18,7 @@ import { createReminder, listReminders, ackReminder, pruneReminders } from '../b
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
 import { nextFireFromCron } from '../daemon/cron-scheduler.js';
-import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
+import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs, KBIngestIncompleteError } from '../bus/knowledge-base.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv, resolveTargetAgentDir } from '../utils/env.js';
@@ -1278,14 +1278,22 @@ busCommand
 
     ensureKBDirs(env.instanceId, env.frameworkRoot, org);
 
-    ingestKnowledgeBase(paths, {
-      org,
-      agent: opts.agent || env.agentName,
-      scope: (opts.scope as 'shared' | 'private') || 'shared',
-      force: opts.force,
-      frameworkRoot: env.frameworkRoot || process.cwd(),
-      instanceId: env.instanceId,
-    });
+    try {
+      ingestKnowledgeBase(paths, {
+        org,
+        agent: opts.agent || env.agentName,
+        scope: (opts.scope as 'shared' | 'private') || 'shared',
+        force: opts.force,
+        frameworkRoot: env.frameworkRoot || process.cwd(),
+        instanceId: env.instanceId,
+      });
+    } catch (err) {
+      if (err instanceof KBIngestIncompleteError) {
+        console.error(err.message);
+        process.exit(1);
+      }
+      throw err;
+    }
   });
 
 busCommand

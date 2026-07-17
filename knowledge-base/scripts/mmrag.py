@@ -1083,6 +1083,7 @@ def cmd_ingest(args):
     total = 0
     skipped = 0
     errors = 0
+    missing = []
 
     try:
         for path_str in args.paths:
@@ -1114,15 +1115,42 @@ def cmd_ingest(args):
                     errors += 1
             else:
                 print(f"NOT FOUND: {p}")
+                missing.append(p)
     finally:
         _tracker.persist()
 
-    print(f"\nDone! Ingested {total} new chunk(s) into '{collection_name}'")
+    # Report against the count of named sources: a caller that asked for 3 and
+    # got 2 needs the denominator to see it. The exit code below must agree with
+    # this summary — callers (heartbeat ingests) key off it, and a zero exit on
+    # a source the KB never got is indistinguishable from a real ingest.
+    named_total = len(args.paths)
+    ingested_from = named_total - len(missing)
+    print(
+        f"\nIngested {total} new chunk(s) into '{collection_name}' "
+        f"from {ingested_from} of {named_total} named source(s)"
+    )
     if skipped:
         print(f"  Skipped: {skipped} (already existed or empty)")
+    if missing:
+        print(f"  NOT FOUND: {len(missing)}")
+        for p in missing:
+            print(f"    - {p}")
     if errors:
         print(f"  Errors: {errors}")
     print(_tracker.summary_line())
+
+    if missing or errors:
+        reasons = []
+        if missing:
+            reasons.append(f"{len(missing)} named source(s) NOT FOUND")
+        if errors:
+            reasons.append(f"{errors} source(s) failed to ingest")
+        # stdout is block-buffered when piped while stderr is not, so without an
+        # explicit flush this verdict overtakes the report it refers to and the
+        # reader sees the conclusion before the evidence.
+        sys.stdout.flush()
+        print(f"\nERROR: ingest incomplete — {', '.join(reasons)}.", file=sys.stderr)
+        sys.exit(1)
 
 
 def deduplicate_results(results, similarity_ratio=0.85):
