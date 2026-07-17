@@ -116,6 +116,27 @@ describe('Bus System', () => {
       expect(report.staged).toContain('readme.md');
     });
 
+    // 'sk-' as a bare unanchored substring matched the middle of ordinary
+    // words. In a framework whose central noun is "task", that blocked a large
+    // share of legitimate files from auto-commit.
+    it('does not treat the word "task-" as an OpenAI key', () => {
+      writeFileSync(join(gitDir, 'notes.md'), 'run cortextos bus task-worktree start, see task/<task-name>');
+      writeFileSync(join(gitDir, 'other.md'), 'disk-usage, risk-model and ask-user are also not keys');
+
+      const report = autoCommit(gitDir, true);
+      expect(report.staged).toContain('notes.md');
+      expect(report.staged).toContain('other.md');
+      expect(report.blocked).toEqual([]);
+    });
+
+    it('still blocks a real sk- key', () => {
+      writeFileSync(join(gitDir, 'leaky.md'), 'OPENAI_API_KEY=sk-proj-abcdefghijklmnop0123456789');
+
+      const report = autoCommit(gitDir, true);
+      expect(report.blocked.some(b => b.includes('leaky.md') && b.includes('credential'))).toBe(true);
+      expect(report.staged).not.toContain('leaky.md');
+    });
+
     it('allows script files even with credential-like patterns', () => {
       writeFileSync(join(gitDir, 'deploy.sh'), '#!/bin/bash\ntoken=get_from_env');
       writeFileSync(join(gitDir, 'app.py'), 'password=input("Enter:")');

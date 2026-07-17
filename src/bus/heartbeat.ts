@@ -145,3 +145,93 @@ export function readAllHeartbeats(paths: BusPaths): Heartbeat[] {
 
   return heartbeats;
 }
+
+// --- Heartbeat staleness -----------------------------------------------------
+
+/**
+ * How many of an agent's own heartbeat intervals may elapse before its last
+ * heartbeat is considered stale. One missed cycle is jitter; two is a signal.
+ */
+export const STALE_INTERVAL_MULTIPLIER = 2;
+
+/**
+ * Assumed interval when an agent's real one cannot be resolved. Matches the
+ * heartbeat cadence the agent templates ship with.
+ */
+export const ASSUMED_HEARTBEAT_INTERVAL_MS = 4 * 60 * 60 * 1000;
+
+export interface StalenessThreshold {
+  /** Age at which this agent's heartbeat is stale. */
+  staleAfterMs: number;
+  /**
+   * Where staleAfterMs came from. 'agent-interval' means it was derived from
+   * the agent's own heartbeat cron; 'assumed' means the interval could not be
+   * resolved and ASSUMED_HEARTBEAT_INTERVAL_MS was used instead.
+   *
+   * Callers should surface 'assumed' rather than hide it. A staleness verdict
+   * is a claim about a SUBJECT's schedule; when we could not read that
+   * schedule, the verdict rests on a belief about the subject rather than a
+   * measurement of it, and that difference is exactly what a bare threshold
+   * hides.
+   */
+  basis: 'agent-interval' | 'assumed';
+}
+
+/**
+ * Resolve the staleness threshold for one agent from its OWN heartbeat cron.
+ *
+ * A fixed threshold measures every agent against a constant instead of against
+ * the schedule it actually runs on: a 4h-loop agent is "2h stale" for half of
+ * every healthy cycle, and a 2h-loop agent has zero margin for jitter. The
+ * referent for "late" is the subject's own interval, not a number we picked.
+ *
+ * Cron-expression schedules (e.g. "0 *""/4 * * *") are not durations and are
+ * reported as 'assumed' rather than guessed at.
+ */
+export function resolveStalenessThreshold(
+  agentName: string,
+  deps: {
+    readCrons: (agent: string) => Array<{ name: string; schedule?: string; enabled?: boolean }>;
+    parseDurationMs: (interval: string) => number;
+  },
+): StalenessThreshold {
+  try {
+    const heartbeatCron = deps
+      .readCrons(agentName)
+      .find((c) => c.name === 'heartbeat' && c.enabled !== false);
+    if (heartbeatCron?.schedule) {
+      const intervalMs = deps.parseDurationMs(heartbeatCron.schedule);
+      if (Number.isFinite(intervalMs) && intervalMs > 0) {
+        return {
+          staleAfterMs: intervalMs * STALE_INTERVAL_MULTIPLIER,
+          basis: 'agent-interval',
+        };
+      }
+    }
+  } catch {
+    // Unreadable crons — fall through to the assumed interval.
+  }
+  // No multiplier here, deliberately. The 2x exists to tolerate ONE MISSED
+  // CYCLE of a schedule we can see; with no resolvable schedule there is no
+  // cycle to tolerate, and extending grace on an agent we know least about
+  // would make uncertainty read as health. Uncertainty alarms earlier, not
+  // later.
+  return {
+    staleAfterMs: ASSUMED_HEARTBEAT_INTERVAL_MS,
+    basis: 'assumed',
+  };
+}
+
+/**
+ * True when `lastHeartbeat` is older than the agent's own staleness threshold.
+ */
+export function isHeartbeatStale(
+  lastHeartbeat: string | undefined,
+  threshold: StalenessThreshold,
+  now: number = Date.now(),
+): boolean {
+  if (!lastHeartbeat) return true;
+  const seen = new Date(lastHeartbeat).getTime();
+  if (Number.isNaN(seen)) return true;
+  return seen < now - threshold.staleAfterMs;
+}
