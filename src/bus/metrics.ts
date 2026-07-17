@@ -7,6 +7,9 @@ import { existsSync, readFileSync, writeFileSync, appendFileSync, readdirSync, m
 import { join, basename, dirname } from 'path';
 import { execSync } from 'child_process';
 import { ensureDir } from '../utils/atomic.js';
+import { resolveStalenessThreshold, isHeartbeatStale } from './heartbeat.js';
+import { readCrons } from './crons.js';
+import { parseDurationMs } from './cron-state.js';
 
 // --- Types ---
 
@@ -16,6 +19,14 @@ export interface AgentMetrics {
   tasks_in_progress: number;
   errors_today: number;
   heartbeat_stale: boolean;
+  /**
+   * What heartbeat_stale was judged against: 'agent-interval' when the agent's
+   * own heartbeat cron could be read, 'assumed' when it could not and a default
+   * interval stood in. A staleness verdict is a claim about a schedule; shipping
+   * the verdict without its basis is what let one bare threshold masquerade as a
+   * measurement of every agent at once.
+   */
+  heartbeat_basis: 'agent-interval' | 'assumed';
 }
 
 export interface SystemMetrics {
@@ -48,7 +59,10 @@ export interface CatalogAddition {
 
 export interface UpstreamResult {
   status: string;
+  /** Commits upstream/main has that we do not — the only basis for "updates available". */
   commits?: number;
+  /** Commits we have that upstream/main does not. Names the direction of a divergence. */
+  ahead?: number;
   diff_stat?: string;
   commit_log?: string;
   changes?: {
@@ -177,19 +191,19 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
       }
     }
 
-    // Check heartbeat staleness (stale if >5 hours old)
+    // Heartbeat staleness, measured against THIS agent's own interval via the
+    // shared helper. This used a fixed 5h while the CLI used a fixed 2h and the
+    // docs said "2x loop interval" — three answers to one question, of which
+    // only the prose had the right referent, and nothing executes prose.
     let heartbeatStale = true;
+    const threshold = resolveStalenessThreshold(agent, { readCrons, parseDurationMs });
     const hbFile = join(ctxRoot, 'state', agent, 'heartbeat.json');
     if (existsSync(hbFile)) {
       try {
         const hb = JSON.parse(readFileSync(hbFile, 'utf-8'));
-        if (hb.last_heartbeat) {
-          const hbTime = new Date(hb.last_heartbeat).getTime();
-          const age = Date.now() - hbTime;
-          if (age < 5 * 60 * 60 * 1000) {
-            heartbeatStale = false;
-            agentsHealthy++;
-          }
+        if (!isHeartbeatStale(hb.last_heartbeat, threshold)) {
+          heartbeatStale = false;
+          agentsHealthy++;
         }
       } catch { /* stale by default */ }
     }
@@ -200,6 +214,7 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
       tasks_in_progress: inProgress,
       errors_today: errorsToday,
       heartbeat_stale: heartbeatStale,
+      heartbeat_basis: threshold.basis,
     };
   }
 
@@ -361,6 +376,30 @@ export function checkUpstream(
   try {
     commitCount = parseInt(execSync('git rev-list HEAD..upstream/main --count', { ...execOpts, stdio: 'pipe' }).trim(), 10);
   } catch { /* default 0 */ }
+
+  // How far ahead we are. Needed to tell "upstream has work for us" apart from
+  // "we have work upstream does not" — the heads differing says only that they
+  // are NOT EQUAL, not which direction the difference runs.
+  let aheadCount = 0;
+  try {
+    aheadCount = parseInt(execSync('git rev-list upstream/main..HEAD --count', { ...execOpts, stdio: 'pipe' }).trim(), 10);
+  } catch { /* default 0 */ }
+
+  // Diverged heads with nothing to pull means we are simply ahead. Reporting
+  // that as "updates_available" inverts the direction: the diff is OUR OWN
+  // commits seen from upstream's side, and its deletions are our additions.
+  // Acting on it would walk the user through their own work as if it were
+  // incoming.
+  if (commitCount === 0) {
+    return {
+      status: 'up_to_date',
+      commits: 0,
+      ahead: aheadCount,
+      message: aheadCount > 0
+        ? `No upstream changes available — local is ${aheadCount} commit(s) ahead of upstream/main`
+        : 'No upstream changes available',
+    };
+  }
 
   let diffStat = '';
   try {

@@ -43,7 +43,20 @@ const EXCLUDED_DIR_PREFIXES = [
   '.venv/',
 ];
 
-const CREDENTIAL_PATTERNS = /(?:token=|key=|password=|secret=|sk-|ghp_|xoxb-|AKIA)/;
+/**
+ * Substrings that suggest a real credential is present in a file.
+ *
+ * `sk-` is anchored and required to be followed by key-shaped characters. As a
+ * bare unanchored substring it matched the middle of ordinary words — `task-`,
+ * `disk-`, `risk-`, `ask-` — and in a framework whose central noun is "task"
+ * that blocked a large share of legitimate files from auto-commit. The prefix
+ * is not the credential; the prefix PLUS the key shape is. Matching the prefix
+ * alone measured the wrong thing.
+ *
+ * The `<thing>=` patterns stay unanchored on purpose: they are followed by an
+ * assignment, which is already the shape that makes them credential-like.
+ */
+const CREDENTIAL_PATTERNS = /(?:token=|key=|password=|secret=|(?:^|[^A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}|ghp_|xoxb-|AKIA)/;
 
 const SCRIPT_EXTENSIONS = new Set(['.sh', '.py', '.js']);
 
