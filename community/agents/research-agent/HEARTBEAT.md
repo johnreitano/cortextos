@@ -134,7 +134,7 @@ Full reference: `.claude/skills/knowledge-base/SKILL.md`
 Keep your memory collection searchable and current:
 
 ```bash
-cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md \
+cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md ./experiments/learnings.md \
   --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private --force
 ```
 
