@@ -1418,16 +1418,29 @@ def cmd_status(args):
 def cmd_list(args):
     config = load_config()
     collection_name = args.collection or config.get("default_collection", "default")
+    as_json = getattr(args, "json", False)
 
+    # `exists` distinguishes "this collection was never created" from "it exists
+    # but holds nothing". Both print as prose here, but a caller joining on-disk
+    # files against ingested sources needs to tell an absent ingest step apart
+    # from an empty one, so JSON mode reports them as different states.
     try:
         collection = get_chroma_collection(collection_name)
     except Exception:
-        print("No data found.")
+        if as_json:
+            print(json.dumps({"collection": collection_name, "exists": False,
+                              "file_count": 0, "chunk_count": 0, "files": []}, indent=2))
+        else:
+            print("No data found.")
         return
 
     all_data = collection.get(include=["metadatas"])
     if not all_data["ids"]:
-        print("No documents in collection.")
+        if as_json:
+            print(json.dumps({"collection": collection_name, "exists": True,
+                              "file_count": 0, "chunk_count": 0, "files": []}, indent=2))
+        else:
+            print("No documents in collection.")
         return
 
     # Group by source
@@ -1436,8 +1449,29 @@ def cmd_list(args):
         src = meta.get("source", "unknown")
         if src not in by_source:
             by_source[src] = {"type": meta.get("type", "unknown"), "chunks": 0,
-                              "filename": meta.get("filename", "")}
+                              "filename": meta.get("filename", ""),
+                              "last_ingested_at": ""}
         by_source[src]["chunks"] += 1
+        # Chunks of one file are written in a single ingest pass, but a --force
+        # re-ingest can leave chunks from several passes; keep the newest so a
+        # freshness check compares against the last time the file was indexed.
+        ingested = meta.get("ingested_at", "") or ""
+        if ingested > by_source[src]["last_ingested_at"]:
+            by_source[src]["last_ingested_at"] = ingested
+
+    if as_json:
+        print(json.dumps({
+            "collection": collection_name,
+            "exists": True,
+            "file_count": len(by_source),
+            "chunk_count": len(all_data["ids"]),
+            "files": [
+                {"source": src, "type": info["type"], "filename": info["filename"],
+                 "chunks": info["chunks"], "last_ingested_at": info["last_ingested_at"]}
+                for src, info in sorted(by_source.items())
+            ],
+        }, indent=2))
+        return
 
     print(f"Collection: {collection_name} ({len(by_source)} files, {len(all_data['ids'])} chunks)")
     print(f"{'Source':<60} {'Type':<15} {'Chunks':<8}")
@@ -1538,6 +1572,7 @@ def main():
     # list
     p_list = sub.add_parser("list", help="List ingested documents")
     p_list.add_argument("--collection", "-c", help="Collection name")
+    p_list.add_argument("--json", "-j", action="store_true", help="Output as JSON")
 
     # collections
     sub.add_parser("collections", help="List all collections")

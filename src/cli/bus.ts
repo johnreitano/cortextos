@@ -19,6 +19,12 @@ import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-stat
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
 import { nextFireFromCron } from '../daemon/cron-scheduler.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
+import {
+  checkAgentKBFreshness,
+  DEFAULT_STALE_HOURS,
+  type KBFreshnessReport,
+} from '../bus/kb-freshness.js';
+import { listAgents } from '../bus/agents.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv, resolveTargetAgentDir } from '../utils/env.js';
@@ -1339,6 +1345,75 @@ busCommand
       // python printed error already
       process.exit(1);
     }
+  });
+
+busCommand
+  .command('check-kb-freshness')
+  .description('Alarm on agents whose KB collection is missing, empty, or behind their on-disk memory')
+  .option('--org <org>', 'Organization name')
+  .option('--agent <name>', 'Check a single agent (default: every agent in the org)')
+  .option('--stale-hours <n>', 'Hours a file may lead its last ingest before warning', String(DEFAULT_STALE_HOURS))
+  .option('--json', 'Output raw JSON')
+  .action((opts: { org?: string; agent?: string; staleHours?: string; json?: boolean }) => {
+    const env = resolveEnv();
+    const org = opts.org || env.org;
+    if (!org) {
+      console.error('ERROR: --org or CTX_ORG required');
+      process.exit(1);
+    }
+
+    const frameworkRoot = env.frameworkRoot || process.cwd();
+    const staleHours = parseFloat(opts.staleHours || String(DEFAULT_STALE_HOURS));
+    if (!Number.isFinite(staleHours) || staleHours < 0) {
+      console.error('ERROR: --stale-hours must be a non-negative number');
+      process.exit(1);
+    }
+
+    const agentNames = opts.agent
+      ? [opts.agent]
+      : listAgents(env.ctxRoot, org).map((a) => a.name);
+
+    const reports: KBFreshnessReport[] = agentNames.map((agent) =>
+      checkAgentKBFreshness({
+        agent,
+        agentDir: join(frameworkRoot, 'orgs', org, 'agents', agent),
+        org,
+        frameworkRoot,
+        instanceId: env.instanceId,
+        staleHours,
+      }),
+    );
+
+    if (opts.json) {
+      console.log(JSON.stringify({ org, reports }, null, 2));
+    } else {
+      console.log(`\n  KB freshness — org ${org} (${reports.length} agent(s))\n`);
+      for (const r of reports) {
+        if (!r.configured) {
+          console.log(`  ${r.agent}: KB not configured for this org — nothing checked`);
+          continue;
+        }
+        const status = r.findings.length === 0 ? 'OK' : `${r.findings.length} finding(s)`;
+        console.log(
+          `  ${r.agent}: ${status} — ${r.indexedFiles}/${r.onDiskFiles} memory file(s) indexed, ` +
+          `${r.chunkCount} chunk(s) across ${r.collectionFiles} source(s) in ${r.collection}`,
+        );
+        for (const f of r.findings) {
+          console.log(`      [${f.severity.toUpperCase()}] ${f.detail}`);
+        }
+      }
+      console.log('');
+    }
+
+    // Exit non-zero on any critical finding so this can gate automation rather
+    // than only inform a reader. The absent-step failure class it detects is
+    // silent by construction: if nobody is watching the output, an alarm that
+    // only prints is the same as no alarm.
+    const criticals = reports.reduce(
+      (n, r) => n + r.findings.filter((f) => f.severity === 'critical').length,
+      0,
+    );
+    if (criticals > 0) process.exit(1);
   });
 
 // ---------------------------------------------------------------------------

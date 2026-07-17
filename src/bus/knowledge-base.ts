@@ -14,7 +14,7 @@ import { normalizeOrgName } from '../utils/org.js';
  * Resolve the Python interpreter inside the knowledge-base venv,
  * accounting for Windows vs Unix layout.
  */
-function getVenvPython(frameworkRoot: string): string {
+export function getVenvPython(frameworkRoot: string): string {
   const isWin = process.platform === 'win32';
   const venvBin = isWin ? 'Scripts' : 'bin';
   const pythonExe = isWin ? 'python.exe' : 'python3';
@@ -68,7 +68,7 @@ function kbConfigured(env: Record<string, string>): boolean {
 /**
  * Build the full env object needed by mmrag.py calls.
  */
-function buildKBEnv(
+export function buildKBEnv(
   frameworkRoot: string,
   org: string,
   instanceId: string,
