@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, existsSync, unlinkSync, statSync } from 'fs'
 import { join } from 'path';
 import type { Heartbeat, BusPaths } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
+import { detectDayNightMode, resolveAgentSchedule } from './agent-schedule.js';
 
 /**
  * SessionEnd-hook end-type markers (see src/hooks/hook-crash-alert.ts). A
@@ -67,12 +68,34 @@ export function updateHeartbeat(
   paths: BusPaths,
   agentName: string,
   status: string,
-  options?: { org?: string; timezone?: string; loopInterval?: string; currentTask?: string; displayName?: string },
-): void {
+  options?: {
+    org?: string;
+    timezone?: string;
+    loopInterval?: string;
+    currentTask?: string;
+    displayName?: string;
+    /** Framework root for config lookup. Defaults to CTX_FRAMEWORK_ROOT, then
+     *  cwd — never paths.ctxRoot, which is the runtime state root and would
+     *  silently resolve to the wrong filesystem location (see approval.ts). */
+    frameworkRoot?: string;
+  },
+): 'day' | 'night' {
   ensureDir(paths.stateDir);
 
   const ts = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-  const mode = options?.timezone ? detectDayNightMode(options.timezone) : detectDayNightMode('UTC');
+
+  // Resolve the schedule from config rather than defaulting to a 'UTC' literal.
+  // The previous default meant config.json's timezone was NEVER read on this
+  // path (nothing passes --timezone), so every agent computed day/night against
+  // UTC on a hardcoded 08:00-22:00 window. An explicitly-passed timezone still
+  // wins — it is an operator override — but the day WINDOW always comes from
+  // config, because the old code had no way to express it at all.
+  const schedule = resolveAgentSchedule(options?.org ?? '', agentName, options?.frameworkRoot);
+  const mode = detectDayNightMode(
+    options?.timezone || schedule.timezone,
+    schedule.dayStart,
+    schedule.dayEnd,
+  );
 
   const heartbeat: Heartbeat = {
     agent: agentName,
@@ -97,24 +120,20 @@ export function updateHeartbeat(
   // cleared on a later heartbeat. This is the primary marker cleanup; the
   // hook's TTL is the failed-start backstop.
   clearEndMarkers(paths.stateDir);
+
+  // Returned so the caller can RECORD the mode. Until 2026-07-22 the flag was
+  // written to heartbeat.json and never logged anywhere, so its value at any
+  // past instant was unrecoverable — every claim about what the flag did had to
+  // be inferred from config plus code rather than witnessed. A mode that cannot
+  // be observed historically cannot be debugged, and cannot settle whether a
+  // behavioural change actually followed from it.
+  return mode;
 }
 
-/**
- * Detect day/night mode based on timezone.
- * Day: 8:00 - 22:00, Night: 22:00 - 8:00
- */
-export function detectDayNightMode(timezone: string): 'day' | 'night' {
-  try {
-    const now = new Date();
-    const formatted = now.toLocaleString('en-US', { timeZone: timezone, hour12: false, hour: '2-digit' });
-    const hour = parseInt(formatted, 10);
-    return (hour >= 8 && hour < 22) ? 'day' : 'night';
-  } catch {
-    // Fallback to UTC
-    const hour = new Date().getUTCHours();
-    return (hour >= 8 && hour < 22) ? 'day' : 'night';
-  }
-}
+// detectDayNightMode moved to ./agent-schedule.js, which resolves the day window
+// from config instead of hardcoding 08:00-22:00. Re-exported so existing
+// importers are unchanged and there remains exactly ONE implementation.
+export { detectDayNightMode } from './agent-schedule.js';
 
 /**
  * Read all agent heartbeats.
