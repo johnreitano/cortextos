@@ -461,9 +461,10 @@ busCommand
       }
     }
 
-    updateHeartbeat(paths, env.agentName, status, {
+    const mode = updateHeartbeat(paths, env.agentName, status, {
       org: env.org,
       timezone: opts.timezone,
+      frameworkRoot: process.env.CTX_FRAMEWORK_ROOT,
       loopInterval: opts.interval,
       currentTask: opts.task,
       displayName,
@@ -472,7 +473,11 @@ busCommand
     // even if the agent itself forgets to call log-event. This makes the
     // dashboard "agents" list derive from heartbeats, not just explicit events.
     try {
-      logEvent(paths, env.agentName, env.org, 'heartbeat', 'heartbeat', 'info', JSON.stringify({ status, task: opts.task ?? '' }));
+      // `mode` is recorded here so the day/night flag is OBSERVABLE HISTORICALLY.
+      // It was previously written only to heartbeat.json, which is overwritten
+      // every cycle, so the flag's value at any past instant was unrecoverable
+      // and questions about its effect could only be answered by inference.
+      logEvent(paths, env.agentName, env.org, 'heartbeat', 'heartbeat', 'info', JSON.stringify({ status, task: opts.task ?? '', mode }));
     } catch {
       // Non-fatal: heartbeat write already succeeded
     }

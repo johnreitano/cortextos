@@ -2,6 +2,7 @@ import { Command } from 'commander';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { stripBom } from '../utils/strip-bom.js';
+import { resolveAgentSchedule } from '../bus/agent-schedule.js';
 
 export const getConfigCommand = new Command('get-config')
   .description('Show resolved operational config for an agent (org defaults + agent overrides)')
@@ -57,10 +58,14 @@ export const getConfigCommand = new Command('get-config')
       : ['external-comms', 'financial', 'deployment', 'data-deletion'];
 
     // Merge: agent wins over org defaults
+    // Schedule fields come from the shared resolver so this command and the
+    // heartbeat writer cannot disagree about an agent's hours. They previously
+    // had separate copies of this chain and the heartbeat's copy was unreachable.
+    const schedule = resolveAgentSchedule(org, agentName, frameworkRoot);
     const resolved = {
-      timezone: agentCfg.timezone || orgCtx.timezone || 'UTC',
-      day_mode_start: agentCfg.day_mode_start || orgCtx.day_mode_start || '08:00',
-      day_mode_end: agentCfg.day_mode_end || orgCtx.day_mode_end || '00:00',
+      timezone: schedule.timezone,
+      day_mode_start: schedule.dayStart,
+      day_mode_end: schedule.dayEnd,
       communication_style: agentCfg.communication_style || orgCtx.communication_style || 'direct and casual',
       approval_rules: agentCfg.approval_rules || {
         always_ask: defaultApprovalCategories,
