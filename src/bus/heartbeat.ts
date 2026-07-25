@@ -13,7 +13,7 @@ import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
  * past the grace window below. The hook's TTL is the backstop for a start that
  * fails before ever heartbeating.
  */
-const END_TYPE_MARKERS = [
+export const END_TYPE_MARKERS = [
   '.restart-planned',
   '.session-refresh',
   '.user-restart',

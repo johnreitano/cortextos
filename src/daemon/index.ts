@@ -5,6 +5,14 @@ import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
 import { ensureDir } from '../utils/atomic.js';
+import {
+  sweepAgents,
+  shouldAlert,
+  fsReaders,
+  type AgentLiveness,
+  type AgentVerdict,
+  type FreshnessState,
+} from './freshness-monitor.js';
 
 // Each fast-checker registers a process-level SIGUSR1 handler (see
 // fast-checker.ts:102). With >10 active agents the default Node listener cap
@@ -182,6 +190,47 @@ function sendCrashLoopAlertBestEffort(
   }
 }
 
+// ─── Heartbeat-freshness monitor (the PID-vs-freshness fix) ───────────────────
+
+/** How often the daemon sweeps agent heartbeat freshness. Well under the wedged
+ *  threshold (~10h on a 4h loop) so a crossing surfaces promptly; a sweep is a
+ *  few small file reads, so 10 min is cheap. Detection latency is bounded by the
+ *  heartbeat interval, not this — see freshness-monitor.ts. */
+const FRESHNESS_SWEEP_MS = 10 * 60_000;
+/** Re-alert cadence while an agent stays in the same stale state (so a
+ *  persistent wedge nags periodically rather than every 10-min sweep). */
+const FRESHNESS_REALERT_MS = 6 * 60 * 60_000;
+
+/** Telegram the operator that an agent is wedged/escalated. Best-effort; the log
+ *  line is the backstop if no operator chat is configured. Mirrors the crash-loop
+ *  alert path. */
+function sendFreshnessAlertBestEffort(frameworkRoot: string, v: AgentVerdict): void {
+  const creds = getOperatorChatCreds(frameworkRoot);
+  const icon = v.state === 'escalate' ? '🔴' : '🟠';
+  const head = v.state === 'escalate' ? 'WEDGED — likely needs restart' : 'WEDGED (process alive, loop stalled)';
+  if (!creds) {
+    console.error(`[daemon] Freshness alert (${v.name}): no operator chat configured — ${v.reason}`);
+    return;
+  }
+  const message =
+    `${icon} cortextOS agent ${v.name}: ${head}\n` +
+    `${v.reason}\n` +
+    `The process is alive but its heartbeat has gone stale — it is not processing crons. ` +
+    `${v.state === 'escalate' ? 'Consider a soft-restart.' : 'Watching; will escalate if it worsens.'}`;
+  try {
+    const r = spawnSync('curl', [
+      '-s', '--max-time', '3', '-X', 'POST',
+      `https://api.telegram.org/bot${creds.botToken}/sendMessage`,
+      '-d', `chat_id=${creds.chatId}`,
+      '--data-urlencode', `text=${message}`,
+    ], { timeout: TELEGRAM_SEND_TIMEOUT_MS, stdio: 'pipe' });
+    if (r.status === 0) console.error(`[daemon] Freshness alert sent for ${v.name} (${v.state})`);
+    else console.error(`[daemon] Freshness alert send failed for ${v.name} (non-fatal)`);
+  } catch {
+    console.error(`[daemon] Freshness alert threw for ${v.name} (non-fatal)`);
+  }
+}
+
 /**
  * Shared fatal-error handler for both uncaughtException and
  * unhandledRejection. Performs marker writes + crash recording + optional
@@ -222,6 +271,36 @@ class Daemon {
   private ipcServer: IPCServer | null = null;
   private instanceId: string;
   private ctxRoot: string;
+  private freshnessTimer: ReturnType<typeof setInterval> | null = null;
+  /** Last freshness alert per agent, for the transition/cooldown logic. */
+  private freshnessAlertLog = new Map<string, { state: FreshnessState; atMs: number }>();
+
+  /**
+   * One heartbeat-freshness sweep across all agents. Reads each agent's
+   * heartbeat.json / crons.json / lifecycle markers, classifies wedged-vs-healthy
+   * (PID-alive is necessary but NOT sufficient — the whole point of the fix), and
+   * alerts the operator on wedged/escalate with transition + cooldown dedup.
+   * Injectable nowMs for tests; wrapped so a sweep error can never crash the daemon.
+   */
+  runFreshnessSweep(frameworkRoot: string, nowMs: number = Date.now()): AgentVerdict[] {
+    if (!this.agentManager) return [];
+    const agents: AgentLiveness[] = this.agentManager.getAllStatuses().map((s) => ({
+      name: s.name,
+      pidAlive: s.status === 'running',
+      stateDir: join(this.ctxRoot, 'state', s.name),
+    }));
+    const verdicts = sweepAgents(agents, fsReaders, nowMs);
+    for (const v of verdicts) {
+      if (shouldAlert(v, this.freshnessAlertLog.get(v.name), nowMs, FRESHNESS_REALERT_MS)) {
+        sendFreshnessAlertBestEffort(frameworkRoot, v);
+        this.freshnessAlertLog.set(v.name, { state: v.state, atMs: nowMs });
+      } else if (v.state === 'healthy' || v.state === 'crashed') {
+        // Recovered / handed to the crash path — clear so a future wedge re-alerts.
+        this.freshnessAlertLog.delete(v.name);
+      }
+    }
+    return verdicts;
+  }
 
   constructor() {
     this.instanceId = process.env.CTX_INSTANCE_ID || 'default';
@@ -268,9 +347,26 @@ class Daemon {
 
     console.log(`[daemon] Running (pid: ${process.pid})`);
 
+    // Heartbeat-freshness monitor: the daemon is the only always-live cross-agent
+    // vantage, so the wedge check lives here (an agent cannot monitor its own
+    // stall). unref() so it never keeps the process alive on its own.
+    this.freshnessTimer = setInterval(() => {
+      try {
+        this.runFreshnessSweep(frameworkRoot);
+      } catch (err) {
+        console.error('[daemon] Freshness sweep error (non-fatal):', err);
+      }
+    }, FRESHNESS_SWEEP_MS);
+    this.freshnessTimer.unref?.();
+    console.log(`[daemon] Heartbeat-freshness monitor started (sweep every ${FRESHNESS_SWEEP_MS / 60_000}m)`);
+
     // Handle shutdown signals
     const shutdown = async () => {
       console.log('[daemon] Shutting down...');
+      if (this.freshnessTimer) {
+        clearInterval(this.freshnessTimer);
+        this.freshnessTimer = null;
+      }
       try {
         if (this.agentManager) {
           await this.agentManager.stopAll();
