@@ -525,8 +525,15 @@ export function listTasks(
   paths: BusPaths,
   filters?: {
     agent?: string;
+    /** Alias for `agent` — both filter `assigned_to`. Exists because create-task
+     *  and the human-tasks skill use `--assignee`, and a query that does not
+     *  accept the field name the docs/crons use silently returns nothing (the
+     *  human-task staleness reminder never fired for exactly this reason). */
+    assignee?: string;
     status?: TaskStatus;
     priority?: Priority;
+    /** Filter by the `project` field, e.g. "human-tasks". */
+    project?: string;
     respectDeps?: boolean;
   },
 ): Task[] {
@@ -546,10 +553,13 @@ export function listTasks(
       const content = readFileSync(join(taskDir, file), 'utf-8');
       const task: Task = JSON.parse(content);
 
-      // Apply filters
+      // Apply filters. `agent` and `assignee` both match `assigned_to` (the
+      // latter matches create-task / the human-tasks skill's flag name).
       if (filters?.agent && task.assigned_to !== filters.agent) continue;
+      if (filters?.assignee && task.assigned_to !== filters.assignee) continue;
       if (filters?.status && task.status !== filters.status) continue;
       if (filters?.priority && task.priority !== filters.priority) continue;
+      if (filters?.project && task.project !== filters.project) continue;
       if (task.archived) continue;
 
       tasks.push(task);

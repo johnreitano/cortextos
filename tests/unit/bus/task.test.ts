@@ -822,4 +822,41 @@ describe('compactTasks — semantic compaction of old completed tasks', () => {
     // Active JSON still present
     expect(existsSync(join(paths.taskDir, `${id}.json`))).toBe(true);
   });
+
+  // Regression: the human-task staleness reminder queried `list-tasks --assignee
+  // human` / `--project human-tasks`, but listTasks only understood `agent`, so
+  // the query matched NOTHING and deadline reminders for [HUMAN] tasks silently
+  // never fired. These assert the human task IS found by the query the cron/skill
+  // actually uses.
+  describe('human-task query filters (assignee + project)', () => {
+    it('a pending assignee=human task is returned by --assignee human --status pending', () => {
+      createTask(paths, 'orchestrator', 'acme', '[HUMAN] pay invoice', {
+        assignee: 'human',
+        project: 'human-tasks',
+      });
+      const byAssignee = listTasks(paths, { assignee: 'human', status: 'pending' });
+      expect(byAssignee.map(t => t.title)).toEqual(['[HUMAN] pay invoice']);
+    });
+
+    it('the same task is returned by --project human-tasks --status pending', () => {
+      createTask(paths, 'orchestrator', 'acme', '[HUMAN] pay invoice', {
+        assignee: 'human',
+        project: 'human-tasks',
+      });
+      const byProject = listTasks(paths, { project: 'human-tasks', status: 'pending' });
+      expect(byProject.map(t => t.title)).toEqual(['[HUMAN] pay invoice']);
+    });
+
+    it('--assignee is an alias for --agent (both match assigned_to)', () => {
+      createTask(paths, 'orchestrator', 'acme', 'agent task', { assignee: 'seo' });
+      expect(listTasks(paths, { assignee: 'seo' }).map(t => t.title)).toEqual(['agent task']);
+      expect(listTasks(paths, { agent: 'seo' }).map(t => t.title)).toEqual(['agent task']);
+    });
+
+    it('project filter excludes non-matching tasks', () => {
+      createTask(paths, 'orchestrator', 'acme', 'human one', { assignee: 'human', project: 'human-tasks' });
+      createTask(paths, 'orchestrator', 'acme', 'other', { assignee: 'dev', project: 'leadio' });
+      expect(listTasks(paths, { project: 'human-tasks' }).map(t => t.title)).toEqual(['human one']);
+    });
+  });
 });

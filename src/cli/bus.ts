@@ -349,16 +349,20 @@ busCommand
 
 busCommand
   .command('list-tasks')
-  .option('--agent <name>', 'Filter by agent')
+  .option('--agent <name>', 'Filter by agent (assigned_to)')
+  .option('--assignee <name>', 'Filter by assignee (assigned_to) — alias of --agent; the name create-task and the human-tasks skill use')
   .option('--status <s>', 'Filter by status')
+  .option('--project <name>', 'Filter by project (e.g. human-tasks)')
   .option('--format <fmt>', 'Output format: json or text', 'text')
   .option('--respect-deps', 'Sort DAG-aware: unblocked tasks first, blocked tasks last')
-  .action((opts: { agent?: string; status?: string; format?: string; respectDeps?: boolean }) => {
+  .action((opts: { agent?: string; assignee?: string; status?: string; project?: string; format?: string; respectDeps?: boolean }) => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const tasks = listTasks(paths, {
       agent: opts.agent,
+      assignee: opts.assignee,
       status: opts.status as TaskStatus,
+      project: opts.project,
       respectDeps: opts.respectDeps ?? false,
     });
 
