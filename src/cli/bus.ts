@@ -1168,9 +1168,40 @@ busCommand
       },
     );
 
+    // A query that could not be run is NOT a query that found nothing. Until
+    // this block existed, both printed "No results found" on stdout and exited
+    // 0, so a caller — human or `RESULT=$(kb-query ...)` — was told the org has
+    // no prior work on the topic when in fact the KB had never been asked.
+    // That is the input that causes work to be redone.
+    //
+    // Rules below, in the order they are applied:
+    //   any failure + no results   -> QUERY FAILED, exit 1 (the empty is unverified)
+    //   any failure + some results -> print results, PARTIAL warning, exit 1 (set is incomplete)
+    //   no failure  + no results   -> "No results found", exit 0 (the ONLY verified empty)
+    const failed = result.failures.length > 0;
+
     if (opts.json) {
       console.log(JSON.stringify(result, null, 2));
+      if (failed) process.exit(1);
       return;
+    }
+
+    for (const f of result.failures) {
+      console.error(`[kb] collection '${f.collection}' could not be queried: ${f.message}`);
+    }
+
+    if (failed && result.results.length === 0) {
+      console.log(
+        `QUERY FAILED (see stderr) — the knowledge base could not be reached for: "${question}"`,
+      );
+      console.log(
+        '  This is NOT an empty result. Prior work on this topic may exist. Fall back to the',
+      );
+      console.log(
+        '  durable record on disk (MEMORY.md, memory/*.md, the org knowledge.md) before concluding',
+      );
+      console.log('  that nothing exists.');
+      process.exit(1);
     }
 
     if (result.results.length === 0) {
@@ -1184,6 +1215,15 @@ busCommand
       console.log(`  [${i + 1}] Score: ${r.score.toFixed(3)} | ${r.source_file}`);
       console.log(`      ${r.content.substring(0, 200).replace(/\n/g, ' ')}...`);
       console.log('');
+    }
+
+    if (failed) {
+      const names = result.failures.map((f) => f.collection).join(', ');
+      console.log(
+        `  PARTIAL RESULTS — ${result.failures.length}/${result.attempted.length} collection(s) could not be queried: ${names}`,
+      );
+      console.log('  The results above are incomplete. Absence from this list proves nothing.');
+      process.exit(1);
     }
   });
 

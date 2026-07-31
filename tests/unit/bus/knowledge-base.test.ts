@@ -144,7 +144,7 @@ describe('ingestKnowledgeBase — graceful missing-config', () => {
 });
 
 describe('queryKnowledgeBase — graceful missing-config', () => {
-  it('missing config: warn + return empty KBQueryResponse, execFileSync NEVER called', () => {
+  it('missing config: warn + report every target collection as FAILED, execFileSync NEVER called', () => {
     mockMissingKbConfig();
 
     const result = queryKnowledgeBase(dummyPaths, 'what is cortextos?', baseOptions);
@@ -155,6 +155,17 @@ describe('queryKnowledgeBase — graceful missing-config', () => {
       total: 0,
       query: 'what is cortextos?',
       collection: 'shared-TestOrg',
+      attempted: ['shared-TestOrg', 'agent-tester'],
+      failures: [
+        {
+          collection: 'shared-TestOrg',
+          message: 'knowledge base not configured for org TestOrg — run setup to enable',
+        },
+        {
+          collection: 'agent-tester',
+          message: 'knowledge base not configured for org TestOrg — run setup to enable',
+        },
+      ],
     });
     expect(warnLog.some((m) => m.includes('TestOrg') && /run setup/i.test(m))).toBe(true);
     expect(warnLog.some((m) => m.includes('[kb]'))).toBe(true);
@@ -178,6 +189,153 @@ describe('queryKnowledgeBase — graceful missing-config', () => {
     expect(result.results[0].content).toBe('hit');
     // Happy path emits no [kb] warning.
     expect(warnLog.filter((m) => m.includes('[kb]'))).toHaveLength(0);
+  });
+});
+
+/**
+ * The defect these cover: a hard probe failure (a 429 from the embedding API,
+ * a timeout, a malformed payload) used to be flattened into `results: []` —
+ * byte-identical to a collection that genuinely holds nothing. Callers then
+ * reported "no prior work exists" off a query that was never answered.
+ *
+ * The load-bearing assertion in this block is the PAIR: `failed` and `empty`
+ * must not produce the same value. Either test alone can pass while the bug is
+ * fully present, so they are written adjacently and neither should be deleted
+ * without the other.
+ */
+describe('queryKnowledgeBase — failed must never look like empty', () => {
+  /** Simulate execFileSync throwing the way a nonzero-exit python probe does. */
+  function throwWithStderr(stderr: string, extra: Record<string, unknown> = {}): void {
+    execFileSyncMock.mockImplementation(() => {
+      const err = new Error('Command failed') as Error & Record<string, unknown>;
+      err.stderr = stderr;
+      Object.assign(err, extra);
+      throw err;
+    });
+  }
+
+  const GEMINI_429 = [
+    'Traceback (most recent call last):',
+    '  File "/x/mmrag.py", line 1, in <module>',
+    "google.genai.errors.ClientError: 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'Your prepayment credits are depleted.', 'status': 'RESOURCE_EXHAUSTED'}}",
+  ].join('\n');
+
+  it('probe fails (429): results empty BUT failures populated — not a clean empty', () => {
+    mockConfiguredKb();
+    throwWithStderr(GEMINI_429);
+
+    const result = queryKnowledgeBase(dummyPaths, 'stripe billing', baseOptions);
+
+    expect(result.results).toEqual([]);
+    // The whole point: emptiness is now qualified.
+    expect(result.failures.length).toBe(result.attempted.length);
+    expect(result.failures.length).toBeGreaterThan(0);
+    expect(result.failures[0].message).toMatch(/RESOURCE_EXHAUSTED/);
+    // Full traceback preserved for the operator, not just the one-line summary.
+    expect(result.failures[0].detail).toContain('Traceback');
+  });
+
+  it('genuine empty: results empty AND failures empty — the only verified "none"', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue(JSON.stringify({ results: [], result_count: 0 }));
+
+    const result = queryKnowledgeBase(dummyPaths, 'stripe billing', baseOptions);
+
+    expect(result.results).toEqual([]);
+    expect(result.failures).toEqual([]);
+  });
+
+  it('the two states are distinguishable (regression guard for the flattening bug)', () => {
+    mockConfiguredKb();
+
+    execFileSyncMock.mockReturnValue(JSON.stringify({ results: [], result_count: 0 }));
+    const genuinelyEmpty = queryKnowledgeBase(dummyPaths, 'q', baseOptions);
+
+    throwWithStderr(GEMINI_429);
+    const failed = queryKnowledgeBase(dummyPaths, 'q', baseOptions);
+
+    // Both have zero results. That is exactly why `results` alone can never be
+    // the signal, and why the old code was wrong to treat it as one.
+    expect(genuinelyEmpty.results).toEqual(failed.results);
+    expect(genuinelyEmpty).not.toEqual(failed);
+    expect(genuinelyEmpty.failures.length).toBe(0);
+    expect(failed.failures.length).toBeGreaterThan(0);
+  });
+
+  it('partial failure: one collection answers, one errors — results kept, failure recorded', () => {
+    mockConfiguredKb();
+    let call = 0;
+    execFileSyncMock.mockImplementation(() => {
+      call += 1;
+      if (call === 1) {
+        return JSON.stringify({
+          results: [{ content: 'hit', similarity: 0.9, source: 'foo.md', type: 'markdown' }],
+        });
+      }
+      const err = new Error('Command failed') as Error & Record<string, unknown>;
+      err.stderr = GEMINI_429;
+      throw err;
+    });
+
+    // scope 'all' with an agent queries shared-* then agent-*.
+    const result = queryKnowledgeBase(dummyPaths, 'q', baseOptions);
+
+    expect(result.results).toHaveLength(1);
+    expect(result.attempted).toHaveLength(2);
+    // Results exist, but the set is incomplete — absence from it proves nothing.
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0].collection).toBe('agent-tester');
+  });
+
+  it('timeout is named explicitly, not folded into a generic error', () => {
+    mockConfiguredKb();
+    throwWithStderr('', { code: 'ETIMEDOUT', signal: 'SIGTERM' });
+
+    const result = queryKnowledgeBase(dummyPaths, 'q', baseOptions);
+
+    expect(result.failures[0].message).toMatch(/timed out after 30000ms/);
+  });
+
+  it('exit 0 with unparseable output is a FAILURE, not an empty collection', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('mmrag: loading model...\n');
+
+    const result = queryKnowledgeBase(dummyPaths, 'q', baseOptions);
+
+    expect(result.results).toEqual([]);
+    expect(result.failures.length).toBeGreaterThan(0);
+    expect(result.failures[0].message).toMatch(/no JSON payload/);
+  });
+
+  it('exit 0 with truncated JSON is a FAILURE, not an empty collection', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('{"results": [{"content": "half');
+
+    const result = queryKnowledgeBase(dummyPaths, 'q', baseOptions);
+
+    expect(result.results).toEqual([]);
+    expect(result.failures[0].message).toMatch(/malformed JSON/);
+  });
+
+  it('captured stderr is re-emitted, not swallowed by the capture', () => {
+    mockConfiguredKb();
+    throwWithStderr(GEMINI_429);
+
+    const written: string[] = [];
+    const originalWrite = process.stderr.write;
+    process.stderr.write = ((chunk: unknown) => {
+      written.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      queryKnowledgeBase(dummyPaths, 'q', baseOptions);
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+
+    // Switching to stdio:'pipe' must not become a way to LOSE the traceback
+    // the operator used to see.
+    expect(written.join('')).toContain('RESOURCE_EXHAUSTED');
   });
 });
 
